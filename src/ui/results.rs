@@ -26,6 +26,8 @@ impl Widget for ResultsView<'_> {
             stat("acc", format!("{:.1}%", r.accuracy)),
             stat("correct", r.correct_chars),
             stat("incorrect", r.incorrect_chars),
+            stat("extra", r.extra_chars),
+            stat("missed", r.missed_chars),
             stat("time", format!("{}s", r.duration.as_secs())),
             Line::default(),
         ];
@@ -48,4 +50,71 @@ fn stat(label: &str, value: impl Display) -> Line<'static> {
         format!("{label:>9} ").dark_gray(),
         format!("{value:<9}").yellow().bold(),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use super::*;
+
+    fn results() -> Results {
+        Results {
+            net_wpm: 61.6,
+            raw_wpm: 70.2,
+            accuracy: 95.3,
+            correct_chars: 150,
+            incorrect_chars: 4,
+            extra_chars: 2,
+            missed_chars: 1,
+            duration: Duration::from_secs(30),
+        }
+    }
+
+    fn rendered(view: ResultsView<'_>) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(40, 15)).expect("terminal");
+        terminal
+            .draw(|frame| frame.render_widget(view, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..15)
+            .map(|y| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn shows_every_stat() {
+        let results = results();
+        let screen = rendered(ResultsView {
+            results: &results,
+            notice: None,
+        });
+
+        for expected in [
+            "wpm 62",
+            "raw 70",
+            "acc 95.3%",
+            "correct 150",
+            "incorrect 4",
+            "extra 2",
+            "missed 1",
+            "time 30s",
+        ] {
+            assert!(screen.contains(expected), "{expected:?} in\n{screen}");
+        }
+    }
+
+    #[test]
+    fn shows_notice() {
+        let results = results();
+        let screen = rendered(ResultsView {
+            results: &results,
+            notice: Some("history not saved"),
+        });
+
+        assert!(screen.contains("history not saved"), "{screen}");
+    }
 }
