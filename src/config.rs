@@ -1,20 +1,19 @@
 //! User settings persisted as TOML in the XDG config directory.
 //!
-//! The file lives at `$XDG_CONFIG_HOME/tecla/config.toml` on every platform. Without
-//! `XDG_CONFIG_HOME` it falls back to `~/.config` on Linux and macOS, and to `%APPDATA%` on
-//! Windows. Missing keys take their default, so a partial file is valid.
+//! The file lives at `config.toml` in [`paths::config_dir`]. Missing keys take their default,
+//! so a partial file is valid; unknown keys are errors. Saving edits the file in place, keeping
+//! its comments and layout.
 
-use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
+use toml_edit::DocumentMut;
 
 use crate::engine::{Confidence, Rules, StopOnError};
+use crate::paths;
 
-const APP_DIR: &str = "tecla";
 const FILE_NAME: &str = "config.toml";
 /// Longest time test, in seconds.
 const MAX_TIME: u64 = 3600;
@@ -82,7 +81,7 @@ enum StopOnErrorDef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "independent on/off settings, one key each in the file"
@@ -138,18 +137,12 @@ impl Config {
     }
 
     /// The first out-of-range value, if any.
-    fn problem(&self) -> Option<&'static str> {
-        if self.time == 0 {
-            return Some("time must be greater than 0");
+    fn problem(&self) -> Option<String> {
+        if !(1..=MAX_TIME).contains(&self.time) {
+            return Some(format!("time must be between 1 and {MAX_TIME}"));
         }
-        if self.time > MAX_TIME {
-            return Some("time must be at most 3600");
-        }
-        if self.words == 0 {
-            return Some("words must be greater than 0");
-        }
-        if self.words > MAX_WORDS {
-            return Some("words must be at most 10000");
+        if !(1..=MAX_WORDS).contains(&self.words) {
+            return Some(format!("words must be between 1 and {MAX_WORDS}"));
         }
         None
     }
@@ -165,7 +158,7 @@ pub enum ConfigError {
         source: Box<toml::de::Error>,
     },
     #[error("invalid {}: {reason}", .path.display())]
-    Invalid { path: PathBuf, reason: &'static str },
+    Invalid { path: PathBuf, reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -180,16 +173,7 @@ impl ConfigFile {
 
     /// The config file in the XDG config directory, or `None` when no home directory is known.
     pub fn in_config_dir() -> Option<Self> {
-        let base = BaseDirs::new();
-        let fallback = base.as_ref().map(|dirs| {
-            if cfg!(windows) {
-                dirs.config_dir().to_owned()
-            } else {
-                dirs.home_dir().join(".config")
-            }
-        });
-        let dir = config_home(std::env::var_os("XDG_CONFIG_HOME"), fallback)?;
-        Some(Self::new(dir.join(APP_DIR).join(FILE_NAME)))
+        Some(Self::new(paths::config_dir()?.join(FILE_NAME)))
     }
 
     pub fn path(&self) -> &Path {
@@ -226,50 +210,68 @@ impl ConfigFile {
         Ok(config)
     }
 
-    /// Writes `config`, creating the directory if needed. The file is replaced atomically so an
-    /// interrupted write never leaves it truncated.
+    /// Writes `config` into the existing file, keeping its comments and layout, and creating
+    /// the directory if needed. The file is replaced atomically so an interrupted write never
+    /// leaves it truncated.
     ///
     /// # Errors
     ///
-    /// Returns an error if the directory or file cannot be created or written.
+    /// Returns an error if the existing file cannot be read or is not valid TOML, or the
+    /// directory or file cannot be created or written.
     pub fn save(&self, config: &Config) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let text = toml::to_string(config).map_err(io::Error::other)?;
+        let mut doc = match fs::read_to_string(&self.path) {
+            Ok(text) => parse_document(&text)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => DocumentMut::new(),
+            Err(e) => return Err(e),
+        };
+        let fresh = toml::to_string(config).map_err(io::Error::other)?;
+        merge(&mut doc, &parse_document(&fresh)?);
+
         let tmp = self.path.with_extension("toml.tmp");
-        fs::write(&tmp, text)?;
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(doc.to_string().as_bytes())?;
+        file.sync_all()?;
         fs::rename(&tmp, &self.path)
     }
 }
 
-/// `XDG_CONFIG_HOME` when set to an absolute path, as the XDG spec requires, else `fallback`.
-fn config_home(xdg: Option<OsString>, fallback: Option<PathBuf>) -> Option<PathBuf> {
-    xdg.map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or(fallback)
+fn parse_document(text: &str) -> io::Result<DocumentMut> {
+    text.parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Copies every key of `fresh` into `doc`. A changed value keeps the comment and spacing
+/// around it, and an unchanged one is left exactly as written.
+fn merge(doc: &mut DocumentMut, fresh: &DocumentMut) {
+    for (key, item) in fresh.iter() {
+        let (Some(old), Some(new)) = (
+            doc.get_mut(key).and_then(|i| i.as_value_mut()),
+            item.as_value(),
+        ) else {
+            doc.insert(key, item.clone());
+            continue;
+        };
+        if undecorated(old) != undecorated(new) {
+            let decor = old.decor().clone();
+            *old = new.clone();
+            *old.decor_mut() = decor;
+        }
+    }
+}
+
+fn undecorated(value: &toml_edit::Value) -> String {
+    let mut value = value.clone();
+    value.decor_mut().clear();
+    value.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("tecla-config-test-{}-{name}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
-            Self(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_util::TempDir;
 
     fn file(dir: &TempDir) -> ConfigFile {
         ConfigFile::new(dir.0.join("tecla/config.toml"))
@@ -336,100 +338,126 @@ mod tests {
         }
     }
 
-    fn serialized(config: &Config) -> String {
-        toml::to_string(config).expect("serialize")
+    #[test]
+    fn unknown_key_is_an_error() {
+        let dir = TempDir::new("unknown");
+        let file = file(&dir);
+        fs::create_dir_all(file.path().parent().unwrap()).expect("create dir");
+        fs::write(file.path(), "live_wmp = true\n").expect("write");
+
+        assert!(matches!(file.load(), Err(ConfigError::Parse { .. })));
+    }
+
+    #[test]
+    fn save_keeps_comments_and_layout() {
+        let dir = TempDir::new("comments");
+        let file = file(&dir);
+        fs::create_dir_all(file.path().parent().unwrap()).expect("create dir");
+        fs::write(
+            file.path(),
+            "# my settings\nmode = \"time\"  # time | words\ncaret = \"bar\"\n",
+        )
+        .expect("write");
+        let config = Config {
+            mode: Mode::Words,
+            ..file.load().expect("load")
+        };
+
+        file.save(&config).expect("save");
+        let text = fs::read_to_string(file.path()).expect("read");
+        assert!(
+            text.starts_with("# my settings\nmode = \"words\"  # time | words\ncaret = \"bar\"\n"),
+            "{text}"
+        );
+        assert_eq!(file.load().expect("reload"), config);
+    }
+
+    /// Checks that `all` lists every value in declaration order (`ordinal`), and that each
+    /// one's `name` is what the file stores under `key`.
+    fn assert_names_match<T: Copy + std::fmt::Debug>(
+        all: &[T],
+        ordinal: fn(T) -> usize,
+        key: &str,
+        name: fn(T) -> &'static str,
+        with: fn(T) -> Config,
+    ) {
+        for (i, &value) in all.iter().enumerate() {
+            assert_eq!(i, ordinal(value), "{value:?} out of place in ALL");
+            let text = toml::to_string(&with(value)).expect("serialize");
+            let expected = format!("{key} = \"{}\"", name(value));
+            assert!(text.contains(&expected), "{text}");
+        }
     }
 
     #[test]
     fn mode_names_match_the_file() {
-        for (i, mode) in Mode::ALL.into_iter().enumerate() {
-            let ordinal = match mode {
+        assert_names_match(
+            &Mode::ALL,
+            |mode| match mode {
                 Mode::Time => 0,
                 Mode::Words => 1,
-            };
-            assert_eq!(i, ordinal, "{mode:?} out of place in ALL");
-            let text = serialized(&Config {
+            },
+            "mode",
+            Mode::as_str,
+            |mode| Config {
                 mode,
                 ..Config::default()
-            });
-            assert!(
-                text.contains(&format!("mode = \"{}\"", mode.as_str())),
-                "{text}"
-            );
-        }
+            },
+        );
     }
 
     #[test]
     fn caret_names_match_the_file() {
-        for (i, caret) in Caret::ALL.into_iter().enumerate() {
-            let ordinal = match caret {
+        assert_names_match(
+            &Caret::ALL,
+            |caret| match caret {
                 Caret::Block => 0,
                 Caret::Bar => 1,
                 Caret::Underline => 2,
                 Caret::Off => 3,
-            };
-            assert_eq!(i, ordinal, "{caret:?} out of place in ALL");
-            let text = serialized(&Config {
+            },
+            "caret",
+            Caret::as_str,
+            |caret| Config {
                 caret,
                 ..Config::default()
-            });
-            assert!(
-                text.contains(&format!("caret = \"{}\"", caret.as_str())),
-                "{text}"
-            );
-        }
+            },
+        );
     }
 
     #[test]
     fn confidence_names_match_the_file() {
-        for (i, confidence) in Confidence::ALL.into_iter().enumerate() {
-            let ordinal = match confidence {
+        assert_names_match(
+            &Confidence::ALL,
+            |confidence| match confidence {
                 Confidence::Off => 0,
                 Confidence::On => 1,
                 Confidence::Max => 2,
-            };
-            assert_eq!(i, ordinal, "{confidence:?} out of place in ALL");
-            let text = serialized(&Config {
+            },
+            "confidence",
+            Confidence::as_str,
+            |confidence| Config {
                 confidence,
                 ..Config::default()
-            });
-            let expected = format!("confidence = \"{}\"", confidence.as_str());
-            assert!(text.contains(&expected), "{text}");
-        }
+            },
+        );
     }
 
     #[test]
     fn stop_on_error_names_match_the_file() {
-        for (i, stop_on_error) in StopOnError::ALL.into_iter().enumerate() {
-            let ordinal = match stop_on_error {
+        assert_names_match(
+            &StopOnError::ALL,
+            |stop_on_error| match stop_on_error {
                 StopOnError::Off => 0,
                 StopOnError::Letter => 1,
                 StopOnError::Word => 2,
-            };
-            assert_eq!(i, ordinal, "{stop_on_error:?} out of place in ALL");
-            let text = serialized(&Config {
+            },
+            "stop_on_error",
+            StopOnError::as_str,
+            |stop_on_error| Config {
                 stop_on_error,
                 ..Config::default()
-            });
-            let expected = format!("stop_on_error = \"{}\"", stop_on_error.as_str());
-            assert!(text.contains(&expected), "{text}");
-        }
-    }
-
-    #[test]
-    fn xdg_config_home_must_be_absolute() {
-        let fallback = Some(PathBuf::from("fallback"));
-        let absolute = std::env::temp_dir();
-
-        assert_eq!(
-            config_home(Some(absolute.clone().into()), fallback.clone()),
-            Some(absolute)
+            },
         );
-        assert_eq!(
-            config_home(Some("relative".into()), fallback.clone()),
-            fallback
-        );
-        assert_eq!(config_home(None, fallback.clone()), fallback);
-        assert_eq!(config_home(None, None), None);
     }
 }

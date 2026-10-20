@@ -34,12 +34,11 @@ pub fn draw(app: &App, frame: &mut Frame) {
                 now: Instant::now(),
                 notice: app.config_notice.as_deref(),
             };
-            if app.config.caret != Caret::Off
-                && let Some(caret) = view.caret_position(area)
+            if let Some(caret) = view.render_with_caret(area, frame.buffer_mut())
+                && app.config.caret != Caret::Off
             {
                 frame.set_cursor_position(caret);
             }
-            frame.render_widget(view, area);
         }
         Screen::Settings { selected } => frame.render_widget(
             SettingsView {

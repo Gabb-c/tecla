@@ -108,7 +108,7 @@ impl Tally {
             let on_track = if committed {
                 session.is_word_correct(word)
             } else {
-                target.starts_with(typed)
+                session.is_on_track(word)
             };
             if on_track {
                 tally.net += typed.len() + space;
@@ -147,7 +147,7 @@ mod tests {
 
     fn finished(target: &str, inputs: &[Input], limit: Duration) -> Session {
         let start = Instant::now();
-        let mut session = Session::new(target, Limit::Time(limit));
+        let mut session = Session::new(target.split_whitespace(), Limit::Time(limit));
         for &input in inputs {
             session.handle(input, start);
         }
@@ -217,6 +217,20 @@ mod tests {
     }
 
     #[test]
+    fn partial_cluster_counts_towards_live_wpm() {
+        let start = Instant::now();
+        let mut session = Session::new(
+            "e\u{301}".split_whitespace(),
+            Limit::Time(Duration::from_secs(60)),
+        );
+        session.handle(Input::Char('e'), start);
+        let live = Live::at(&session, start + Duration::from_secs(12));
+
+        // 1 char / 5 = 0.2 words in a fifth of a minute
+        assert_eq!(live.wpm, 1.0);
+    }
+
+    #[test]
     fn zero_elapsed_time_gives_zero_wpm() {
         assert_eq!(wpm(50, Duration::ZERO), 0.0);
     }
@@ -229,7 +243,10 @@ mod tests {
 
     #[test]
     fn unstarted_session_gives_zero_results() {
-        let session = Session::new("abc", Limit::Time(Duration::from_secs(30)));
+        let session = Session::new(
+            "abc".split_whitespace(),
+            Limit::Time(Duration::from_secs(30)),
+        );
         let results = Results::from_session(&session);
 
         assert_eq!(results.net_wpm, 0.0);
@@ -241,7 +258,10 @@ mod tests {
     #[test]
     fn live_stats_use_elapsed_time_so_far() {
         let start = Instant::now();
-        let mut session = Session::new("hello world", Limit::Time(Duration::from_secs(60)));
+        let mut session = Session::new(
+            "hello world".split_whitespace(),
+            Limit::Time(Duration::from_secs(60)),
+        );
         for input in chars("hello wx") {
             session.handle(input, start);
         }

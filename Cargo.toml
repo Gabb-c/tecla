@@ -5,6 +5,11 @@ description = "A minimalist typing test for the terminal"
 authors = ["Gabb-c <gdgabrieldacunha71@gmail.com>"]
 license = "MIT OR Apache-2.0"
 edition = "2024"
+rust-version = "1.88"
+repository = "https://github.com/Gabb-c/tecla"
+readme = "README.md"
+keywords = ["typing", "typing-test", "tui", "terminal", "wpm"]
+categories = ["command-line-utilities", "games"]
 
 [dependencies]
 ratatui = "0.30.2"
@@ -16,6 +21,7 @@ directories = "6.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
 toml = "1.1.8"
+toml_edit = "0.25.17"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

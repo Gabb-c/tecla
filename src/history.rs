@@ -1,13 +1,13 @@
-//! Test results persisted as JSON Lines in the user's data directory.
+//! Test results persisted as JSON Lines at `history.jsonl` in [`paths::data_dir`].
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Mode;
+use crate::paths;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -33,17 +33,17 @@ impl History {
         Self { path: path.into() }
     }
 
-    /// History in the platform data directory, or `None` when no home directory is known.
+    /// History in the XDG data directory, or `None` when no home directory is known.
     pub fn in_data_dir() -> Option<Self> {
-        let dirs = ProjectDirs::from("", "", "tecla")?;
-        Some(Self::new(dirs.data_dir().join("history.jsonl")))
+        Some(Self::new(paths::data_dir()?.join("history.jsonl")))
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Appends `record` as one line, creating the file and its directory if needed.
+    /// Appends `record` as one line, creating the file and its directory if needed. The line
+    /// goes out in a single write so lines from concurrent appends stay whole.
     ///
     /// # Errors
     ///
@@ -56,8 +56,9 @@ impl History {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        let line = serde_json::to_string(record)?;
-        writeln!(file, "{line}")
+        let mut line = serde_json::to_string(record)?;
+        line.push('\n');
+        file.write_all(line.as_bytes())
     }
 
     /// Reads every record; a missing file is an empty history.
@@ -66,7 +67,10 @@ impl History {
     ///
     /// Returns an error if the file cannot be read, or [`io::ErrorKind::InvalidData`] if a
     /// line is not a valid record.
+    #[cfg(test)]
     pub fn read(&self) -> io::Result<Vec<Record>> {
+        use std::io::{BufRead, BufReader};
+
         let file = match fs::File::open(&self.path) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -83,23 +87,7 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("tecla-test-{}-{name}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
-            Self(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_util::TempDir;
 
     fn record(wpm: f64) -> Record {
         Record {

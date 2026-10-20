@@ -121,9 +121,10 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(target: &str, limit: Limit) -> Self {
+    /// Starts a session over `words`, each a single word without whitespace.
+    pub fn new<'a>(words: impl IntoIterator<Item = &'a str>, limit: Limit) -> Self {
         Self {
-            target: words(target),
+            target: split_graphemes(words),
             typed: vec![Vec::new()],
             keystrokes: Vec::new(),
             limit,
@@ -139,8 +140,8 @@ impl Session {
     }
 
     /// Appends more target words, e.g. when the user is about to run out of words.
-    pub fn extend(&mut self, text: &str) {
-        self.target.extend(words(text));
+    pub fn extend<'a>(&mut self, words: impl IntoIterator<Item = &'a str>) {
+        self.target.extend(split_graphemes(words));
     }
 
     /// Applies one input at `now`. The first non-space character starts the timer; input after
@@ -235,7 +236,7 @@ impl Session {
 
     pub fn letter_state(&self, word: usize, letter: usize) -> LetterState {
         match self.typed.get(word).and_then(|typed| typed.get(letter)) {
-            Some(typed) if self.target[word].get(letter) == Some(typed) => LetterState::Correct,
+            Some(typed) if self.letter_matches(word, letter, typed) => LetterState::Correct,
             Some(_) => LetterState::Incorrect,
             None if word < self.current_word() => LetterState::Missed,
             None => LetterState::Untyped,
@@ -253,6 +254,26 @@ impl Session {
 
     pub fn is_word_correct(&self, word: usize) -> bool {
         self.typed.get(word) == self.target.get(word)
+    }
+
+    /// Whether `word` is correct so far: every typed letter matches and none are extra.
+    pub fn is_on_track(&self, word: usize) -> bool {
+        self.typed.get(word).is_some_and(|typed| {
+            typed
+                .iter()
+                .enumerate()
+                .all(|(letter, grapheme)| self.letter_matches(word, letter, grapheme))
+        })
+    }
+
+    /// Whether `typed` matches the target letter. The letter at the caret may be a cluster
+    /// still waiting for its combining marks.
+    fn letter_matches(&self, word: usize, letter: usize, typed: &str) -> bool {
+        let Some(expected) = self.target.get(word).and_then(|target| target.get(letter)) else {
+            return false;
+        };
+        let at_caret = word == self.current_word() && letter + 1 == self.typed[word].len();
+        expected == typed || (at_caret && expected.starts_with(typed))
     }
 
     fn type_char(&mut self, c: char) {
@@ -349,8 +370,9 @@ impl Session {
     }
 }
 
-fn words(text: &str) -> Vec<Vec<String>> {
-    text.split_whitespace()
+fn split_graphemes<'a>(words: impl IntoIterator<Item = &'a str>) -> Vec<Vec<String>> {
+    words
+        .into_iter()
         .map(|word| word.graphemes(true).map(str::to_owned).collect())
         .collect()
 }
@@ -388,7 +410,7 @@ mod tests {
     #[test]
     fn correct_typing() {
         let now = Instant::now();
-        let mut session = Session::new("hi you", LIMIT);
+        let mut session = Session::new("hi you".split_whitespace(), LIMIT);
         type_str(&mut session, "hi you", now);
 
         assert_eq!(typed(&session), ["hi", "you"]);
@@ -406,7 +428,7 @@ mod tests {
         use LetterState::*;
 
         let now = Instant::now();
-        let mut session = Session::new("abc", LIMIT);
+        let mut session = Session::new("abc".split_whitespace(), LIMIT);
         type_str(&mut session, "axc", now);
 
         assert_eq!(states(&session, 0), [Correct, Incorrect, Correct]);
@@ -416,7 +438,7 @@ mod tests {
     #[test]
     fn extra_letters_stay_in_their_word() {
         let now = Instant::now();
-        let mut session = Session::new("ab cd", LIMIT);
+        let mut session = Session::new("ab cd".split_whitespace(), LIMIT);
         type_str(&mut session, "abx cd", now);
 
         assert_eq!(session.extra(0), ["x"]);
@@ -431,7 +453,7 @@ mod tests {
     #[test]
     fn extra_letters_are_capped() {
         let now = Instant::now();
-        let mut session = Session::new("ab", LIMIT);
+        let mut session = Session::new("ab".split_whitespace(), LIMIT);
         type_str(&mut session, &format!("ab{}", "x".repeat(15)), now);
 
         assert_eq!(session.extra(0).len(), MAX_EXTRA);
@@ -443,7 +465,7 @@ mod tests {
         use LetterState::*;
 
         let now = Instant::now();
-        let mut session = Session::new("abc de", LIMIT);
+        let mut session = Session::new("abc de".split_whitespace(), LIMIT);
         type_str(&mut session, "a d", now);
 
         assert_eq!(states(&session, 0), [Correct, Missed, Missed]);
@@ -454,7 +476,7 @@ mod tests {
     #[test]
     fn space_on_empty_word_is_ignored() {
         let now = Instant::now();
-        let mut session = Session::new("ab cd", LIMIT);
+        let mut session = Session::new("ab cd".split_whitespace(), LIMIT);
         type_str(&mut session, " ", now);
         assert!(!session.is_started());
 
@@ -466,7 +488,7 @@ mod tests {
     #[test]
     fn space_on_last_word_is_ignored() {
         let now = Instant::now();
-        let mut session = Session::new("ab", LIMIT);
+        let mut session = Session::new("ab".split_whitespace(), LIMIT);
         type_str(&mut session, "ab ", now);
 
         assert_eq!(session.current_word(), 0);
@@ -476,7 +498,7 @@ mod tests {
     #[test]
     fn backspace_removes_last_grapheme() {
         let now = Instant::now();
-        let mut session = Session::new("abc", LIMIT);
+        let mut session = Session::new("abc".split_whitespace(), LIMIT);
         type_str(&mut session, "ax", now);
         session.handle(Input::Backspace, now);
 
@@ -488,7 +510,7 @@ mod tests {
     #[test]
     fn backspace_returns_to_wrong_previous_word() {
         let now = Instant::now();
-        let mut session = Session::new("ab cd", LIMIT);
+        let mut session = Session::new("ab cd".split_whitespace(), LIMIT);
         type_str(&mut session, "ax ", now);
 
         session.handle(Input::Backspace, now);
@@ -502,7 +524,7 @@ mod tests {
     #[test]
     fn backspace_does_not_enter_correct_previous_word() {
         let now = Instant::now();
-        let mut session = Session::new("ab cd", LIMIT);
+        let mut session = Session::new("ab cd".split_whitespace(), LIMIT);
         type_str(&mut session, "ab ", now);
         session.handle(Input::Backspace, now);
 
@@ -513,7 +535,7 @@ mod tests {
     #[test]
     fn backspace_at_start_is_noop() {
         let now = Instant::now();
-        let mut session = Session::new("abc", LIMIT);
+        let mut session = Session::new("abc".split_whitespace(), LIMIT);
         session.handle(Input::Backspace, now);
         assert_eq!(typed(&session), [""]);
         assert_eq!(session.keystrokes(), Vec::<Keystroke>::new());
@@ -529,7 +551,7 @@ mod tests {
     #[test]
     fn delete_word_clears_current_word() {
         let now = Instant::now();
-        let mut session = Session::new("abc de", LIMIT);
+        let mut session = Session::new("abc de".split_whitespace(), LIMIT);
         type_str(&mut session, "ab", now);
         session.handle(Input::DeleteWord, now);
 
@@ -540,7 +562,7 @@ mod tests {
     #[test]
     fn delete_word_returns_to_wrong_previous_word() {
         let now = Instant::now();
-        let mut session = Session::new("ab cd", LIMIT);
+        let mut session = Session::new("ab cd".split_whitespace(), LIMIT);
         type_str(&mut session, "ax ", now);
         session.handle(Input::DeleteWord, now);
 
@@ -551,7 +573,7 @@ mod tests {
     #[test]
     fn delete_word_does_not_enter_correct_previous_word() {
         let now = Instant::now();
-        let mut session = Session::new("ab cd", LIMIT);
+        let mut session = Session::new("ab cd".split_whitespace(), LIMIT);
         type_str(&mut session, "ab ", now);
         session.handle(Input::DeleteWord, now);
 
@@ -562,8 +584,8 @@ mod tests {
     #[test]
     fn extend_allows_typing_further() {
         let now = Instant::now();
-        let mut session = Session::new("ab", LIMIT);
-        session.extend("cd");
+        let mut session = Session::new("ab".split_whitespace(), LIMIT);
+        session.extend(["cd"]);
         type_str(&mut session, "ab c", now);
 
         assert_eq!(session.words().len(), 2);
@@ -576,7 +598,7 @@ mod tests {
         use LetterState::*;
 
         let now = Instant::now();
-        let mut session = Session::new("ação", LIMIT);
+        let mut session = Session::new("ação".split_whitespace(), LIMIT);
         assert_eq!(session.words()[0].len(), 4);
 
         type_str(&mut session, "acão", now);
@@ -586,7 +608,7 @@ mod tests {
     #[test]
     fn combining_mark_joins_previous_grapheme() {
         let now = Instant::now();
-        let mut session = Session::new("e\u{301}x", LIMIT);
+        let mut session = Session::new("e\u{301}x".split_whitespace(), LIMIT);
         assert_eq!(session.words()[0].len(), 2);
 
         type_str(&mut session, "e\u{301}", now);
@@ -599,9 +621,29 @@ mod tests {
     }
 
     #[test]
+    fn partial_cluster_at_caret_is_correct() {
+        let now = Instant::now();
+        let mut session = Session::new("e\u{301}x".split_whitespace(), LIMIT);
+        type_str(&mut session, "e", now);
+
+        assert_eq!(session.letter_state(0, 0), LetterState::Correct);
+        assert!(session.is_on_track(0));
+    }
+
+    #[test]
+    fn partial_cluster_left_behind_is_incorrect() {
+        let now = Instant::now();
+        let mut session = Session::new("e\u{301}x".split_whitespace(), LIMIT);
+        type_str(&mut session, "ex", now);
+
+        assert_eq!(session.letter_state(0, 0), LetterState::Incorrect);
+        assert!(!session.is_on_track(0));
+    }
+
+    #[test]
     fn combining_mark_on_wrong_base_is_incorrect() {
         let now = Instant::now();
-        let mut session = Session::new("e\u{301}", LIMIT);
+        let mut session = Session::new("e\u{301}".split_whitespace(), LIMIT);
         type_str(&mut session, "a\u{301}", now);
 
         assert_eq!(session.letter_state(0, 0), LetterState::Incorrect);
@@ -614,7 +656,7 @@ mod tests {
     #[test]
     fn timer_starts_on_first_key() {
         let t0 = Instant::now();
-        let mut session = Session::new("abc", LIMIT);
+        let mut session = Session::new("abc".split_whitespace(), LIMIT);
 
         session.tick(t0 + SECS * 2);
         assert!(!session.is_started());
@@ -639,7 +681,7 @@ mod tests {
     #[test]
     fn input_after_end_is_ignored() {
         let start = Instant::now();
-        let mut session = Session::new("abc", LIMIT);
+        let mut session = Session::new("abc".split_whitespace(), LIMIT);
         session.handle(Input::Char('a'), start);
 
         // the expired timer is noticed even without a tick in between
@@ -652,13 +694,13 @@ mod tests {
     }
 
     fn with_rules(target: &str, rules: Rules) -> Session {
-        Session::new(target, LIMIT).with_rules(rules)
+        Session::new(target.split_whitespace(), LIMIT).with_rules(rules)
     }
 
     #[test]
     fn words_mode_ends_when_last_word_is_correct() {
         let start = Instant::now();
-        let mut session = Session::new("ab cd", Limit::Words);
+        let mut session = Session::new("ab cd".split_whitespace(), Limit::Words);
         session.handle(Input::Char('a'), start);
         type_str(&mut session, "b c", start);
         assert!(!session.is_finished());
@@ -673,7 +715,7 @@ mod tests {
     #[test]
     fn words_mode_ends_on_space_after_last_word() {
         let start = Instant::now();
-        let mut session = Session::new("ab cd", Limit::Words);
+        let mut session = Session::new("ab cd".split_whitespace(), Limit::Words);
         type_str(&mut session, "ab cx", start);
         assert!(!session.is_finished());
 
@@ -689,7 +731,7 @@ mod tests {
     #[test]
     fn words_mode_never_times_out() {
         let start = Instant::now();
-        let mut session = Session::new("ab cd", Limit::Words);
+        let mut session = Session::new("ab cd".split_whitespace(), Limit::Words);
         session.handle(Input::Char('a'), start);
         session.tick(start + Duration::from_secs(3600));
 

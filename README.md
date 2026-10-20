@@ -51,7 +51,8 @@ the XDG config directory:
 | Linux, macOS | `~/.config/tecla/config.toml`                                       |
 | Windows      | `%APPDATA%\tecla\config.toml`                                       |
 
-The file can also be edited by hand; missing keys take their defaults. If it fails to load,
+The file can also be edited by hand; missing keys take their defaults, and unknown keys are an
+error. Saving from the settings screen keeps your comments and layout. If the file fails to load,
 tecla starts with the defaults, shows the error, and leaves the file alone until you fix it.
 
 ```toml
@@ -89,8 +90,13 @@ word) and missed (skipped by moving on to the next word).
 ## History
 
 Each finished test is appended as one JSON line (timestamp, mode, duration, word count in words
-mode, wpm, raw, accuracy) to `history.jsonl` in the platform data directory, e.g.
-`~/.local/share/tecla/` on Linux.
+mode, wpm, raw, accuracy) to `history.jsonl` in the XDG data directory:
+
+| Platform     | Path                                                                |
+| ------------ | ------------------------------------------------------------------- |
+| Any          | `$XDG_DATA_HOME/tecla/history.jsonl`, when `XDG_DATA_HOME` is set   |
+| Linux, macOS | `~/.local/share/tecla/history.jsonl`                                |
+| Windows      | `%APPDATA%\tecla\history.jsonl`                                     |
 
 ## License
 

@@ -53,6 +53,10 @@ pub struct App {
 }
 
 impl App {
+    #[expect(
+        clippy::new_without_default,
+        reason = "reads the config and spawns the event thread"
+    )]
     pub fn new() -> Self {
         let (config, config_file, config_notice) = load_config();
         Self {
@@ -180,8 +184,8 @@ impl App {
         if matches!(self.session.limit(), Limit::Time(_))
             && self.session.remaining_words() < EXTEND_THRESHOLD
         {
-            let more = words::random_words(&mut rand::rng(), EXTRA_WORDS).join(" ");
-            self.session.extend(&more);
+            self.session
+                .extend(words::random_words(&mut rand::rng(), EXTRA_WORDS));
         }
         self.finish_if_done();
     }
@@ -229,12 +233,6 @@ impl App {
     }
 }
 
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// The config file's settings, the file to save changes to, and any problem to report.
 fn load_config() -> (Config, Option<ConfigFile>, Option<String>) {
     let Some(file) = ConfigFile::in_config_dir() else {
@@ -257,8 +255,7 @@ fn new_session(config: &Config) -> Session {
         Mode::Time => (INITIAL_WORDS, Limit::Time(Duration::from_secs(config.time))),
         Mode::Words => (config.words, Limit::Words),
     };
-    let text = words::random_words(&mut rand::rng(), count).join(" ");
-    Session::new(&text, limit).with_rules(config.rules())
+    Session::new(words::random_words(&mut rand::rng(), count), limit).with_rules(config.rules())
 }
 
 fn cursor_style(caret: Caret, blink: bool) -> Option<SetCursorStyle> {
@@ -320,7 +317,7 @@ mod tests {
             config_notice: None,
             config_file: None,
             history: None,
-            events: EventHandler::new(),
+            events: EventHandler::detached(),
         }
     }
 

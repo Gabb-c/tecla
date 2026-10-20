@@ -30,18 +30,19 @@ pub struct EventHandler {
     receiver: mpsc::Receiver<Event>,
 }
 
-impl Default for EventHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl EventHandler {
     /// Spawns the event thread.
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
         let actor = EventThread::new(sender.clone());
         thread::spawn(|| actor.run());
+        Self { sender, receiver }
+    }
+
+    /// A handler without the event thread, so tests never touch the terminal.
+    #[cfg(test)]
+    pub fn detached() -> Self {
+        let (sender, receiver) = mpsc::channel();
         Self { sender, receiver }
     }
 
