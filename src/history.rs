@@ -1,0 +1,147 @@
+//! Test results persisted as JSON Lines in the user's data directory.
+
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+
+use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Time,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Record {
+    /// Seconds since the Unix epoch.
+    pub timestamp: u64,
+    pub mode: Mode,
+    pub duration_secs: u64,
+    pub wpm: f64,
+    pub raw: f64,
+    pub accuracy: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct History {
+    path: PathBuf,
+}
+
+impl History {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// History in the platform data directory, or `None` when no home directory is known.
+    pub fn in_data_dir() -> Option<Self> {
+        let dirs = ProjectDirs::from("", "", "tecla")?;
+        Some(Self::new(dirs.data_dir().join("history.jsonl")))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Appends `record` as one line, creating the file and its directory if needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory or file cannot be created or written.
+    pub fn append(&self, record: &Record) -> io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        let line = serde_json::to_string(record)?;
+        writeln!(file, "{line}")
+    }
+
+    /// Reads every record; a missing file is an empty history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, or [`io::ErrorKind::InvalidData`] if a
+    /// line is not a valid record.
+    pub fn read(&self) -> io::Result<Vec<Record>> {
+        let file = match fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        BufReader::new(file)
+            .lines()
+            .filter(|line| line.as_ref().map_or(true, |l| !l.trim().is_empty()))
+            .map(|line| Ok(serde_json::from_str(&line?)?))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("tecla-test-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn record(wpm: f64) -> Record {
+        Record {
+            timestamp: 1_760_000_000,
+            mode: Mode::Time,
+            duration_secs: 30,
+            wpm,
+            raw: wpm + 5.5,
+            accuracy: 97.25,
+        }
+    }
+
+    #[test]
+    fn round_trip() {
+        let dir = TempDir::new("round-trip");
+        let history = History::new(dir.0.join("nested/history.jsonl"));
+
+        history.append(&record(60.0)).expect("first append");
+        history.append(&record(72.4)).expect("second append");
+
+        let read = history.read().expect("read");
+        assert_eq!(read, [record(60.0), record(72.4)]);
+    }
+
+    #[test]
+    fn missing_file_is_empty_history() {
+        let dir = TempDir::new("missing");
+        let history = History::new(dir.0.join("history.jsonl"));
+        assert_eq!(history.read().expect("read"), Vec::<Record>::new());
+    }
+
+    #[test]
+    fn corrupt_line_is_an_error() {
+        let dir = TempDir::new("corrupt");
+        fs::create_dir_all(&dir.0).expect("create dir");
+        let history = History::new(dir.0.join("history.jsonl"));
+        fs::write(history.path(), "not json\n").expect("write");
+
+        assert_eq!(
+            history.read().expect_err("should fail").kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+}
