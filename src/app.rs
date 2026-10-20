@@ -9,7 +9,7 @@ use crate::engine::{Input, Session};
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::history::{History, Mode, Record};
 use crate::stats::Results;
-use crate::words;
+use crate::{ui, words};
 
 const TEST_DURATION: Duration = Duration::from_secs(30);
 const INITIAL_WORDS: usize = 100;
@@ -61,7 +61,7 @@ impl App {
     /// Returns an error if drawing fails or the terminal stops delivering events.
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         while self.running {
-            terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
+            terminal.draw(|frame| ui::draw(&self, frame))?;
             self.handle_events()?;
         }
         Ok(())

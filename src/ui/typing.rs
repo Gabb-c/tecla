@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Flex, Layout, Rect},
+    layout::{Constraint, Flex, Layout, Position, Rect},
     style::{Style, Stylize},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
@@ -22,20 +22,7 @@ pub struct TypingView<'a> {
 
 impl Widget for TypingView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let width = area.width.saturating_sub(4).min(MAX_WIDTH);
-        let [column] = Layout::horizontal([Constraint::Length(width)])
-            .flex(Flex::Center)
-            .areas(area);
-        let [timer, _, text, _, hints] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(VISIBLE_LINES),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .flex(Flex::Center)
-        .areas(column);
-
+        let [timer, text, hints] = layout(area);
         Line::from(seconds(self.session.remaining(self.now)).to_string())
             .yellow()
             .render(timer, buf);
@@ -48,20 +35,33 @@ impl Widget for TypingView<'_> {
 }
 
 impl TypingView<'_> {
-    fn visible_lines(&self, width: u16) -> Vec<Line<'_>> {
-        let target: Vec<&str> = self.session.target().iter().map(String::as_str).collect();
-        let lines = wrap(&target, usize::from(width));
+    /// Where the terminal cursor should sit when rendered into `area`, if the caret is visible.
+    pub fn caret_position(&self, area: Rect) -> Option<Position> {
+        let [_, text, _] = layout(area);
+        let target = self.target();
         let cursor = self.session.cursor();
-        let cursor_line = lines
-            .iter()
-            .position(|line| line.contains(&cursor))
-            .unwrap_or(lines.len().saturating_sub(1));
-        // keep one line of already-typed context above the cursor
-        let first = cursor_line.saturating_sub(1);
-        lines
+        visible_ranges(&target, cursor, text.width)
             .into_iter()
-            .skip(first)
-            .take(usize::from(VISIBLE_LINES))
+            .zip(text.y..)
+            .find(|(line, _)| line.contains(&cursor))
+            .and_then(|(line, y)| {
+                let offset: usize = target[line.start..cursor]
+                    .iter()
+                    .map(|g| Span::raw(*g).width())
+                    .sum();
+                let offset = u16::try_from(offset).ok().filter(|&x| x < text.width)?;
+                Some(Position::new(text.x + offset, y))
+            })
+    }
+
+    fn target(&self) -> Vec<&str> {
+        self.session.target().iter().map(String::as_str).collect()
+    }
+
+    fn visible_lines(&self, width: u16) -> Vec<Line<'_>> {
+        let target = self.target();
+        visible_ranges(&target, self.session.cursor(), width)
+            .into_iter()
             .map(|line| {
                 line.map(|i| Span::styled(target[i], self.style_at(i, target[i])))
                     .collect()
@@ -70,18 +70,47 @@ impl TypingView<'_> {
     }
 
     fn style_at(&self, index: usize, grapheme: &str) -> Style {
-        let style = match self.session.state_at(index) {
+        match self.session.state_at(index) {
             GraphemeState::Untyped => Style::new().dark_gray(),
             GraphemeState::Correct => Style::new(),
             GraphemeState::Incorrect if grapheme == " " => Style::new().on_red(),
             GraphemeState::Incorrect => Style::new().red(),
-        };
-        if index == self.session.cursor() {
-            style.reversed()
-        } else {
-            style
         }
     }
+}
+
+/// Splits the typing screen into timer, text and hints rows.
+fn layout(area: Rect) -> [Rect; 3] {
+    let width = area.width.saturating_sub(4).min(MAX_WIDTH);
+    let [column] = Layout::horizontal([Constraint::Length(width)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [timer, _, text, _, hints] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(VISIBLE_LINES),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .flex(Flex::Center)
+    .areas(column);
+    [timer, text, hints]
+}
+
+/// The wrapped lines that fit on screen while keeping `cursor` visible.
+fn visible_ranges(target: &[&str], cursor: usize, width: u16) -> Vec<Range<usize>> {
+    let lines = wrap(target, usize::from(width));
+    let cursor_line = lines
+        .iter()
+        .position(|line| line.contains(&cursor))
+        .unwrap_or(lines.len().saturating_sub(1));
+    // keep one line of already-typed context above the cursor
+    let first = cursor_line.saturating_sub(1);
+    lines
+        .into_iter()
+        .skip(first)
+        .take(usize::from(VISIBLE_LINES))
+        .collect()
 }
 
 fn seconds(remaining: Duration) -> u128 {
@@ -168,6 +197,53 @@ mod tests {
 
         assert!(!screen.contains("aaaa"), "{screen}");
         assert!(screen.contains("eeee"), "{screen}");
+    }
+
+    #[test]
+    fn caret_sits_on_next_grapheme() {
+        let now = Instant::now();
+        let mut session = Session::new("hello world", Duration::from_secs(30));
+        for c in "hello ".chars() {
+            session.handle(Input::Char(c), now);
+        }
+        let screen = rendered(&session, now, 40, 10);
+        let row = screen
+            .iter()
+            .position(|l| l.contains("hello world"))
+            .expect("text row");
+        let column = screen[row].find('w').expect("next grapheme");
+
+        let caret = TypingView {
+            session: &session,
+            now,
+        }
+        .caret_position(Rect::new(0, 0, 40, 10))
+        .expect("caret visible");
+
+        assert_eq!(
+            caret,
+            Position::new(u16::try_from(column).unwrap(), u16::try_from(row).unwrap())
+        );
+    }
+
+    #[test]
+    fn caret_follows_wrapped_line() {
+        let now = Instant::now();
+        let mut session = Session::new("aaaa bbbb cccc", Duration::from_secs(30));
+        for c in "aaaa b".chars() {
+            session.handle(Input::Char(c), now);
+        }
+        let area = Rect::new(0, 0, 9, 10);
+        let [_, text, _] = layout(area);
+
+        let caret = TypingView {
+            session: &session,
+            now,
+        }
+        .caret_position(area)
+        .expect("caret visible");
+
+        assert_eq!(caret, Position::new(text.x + 1, text.y + 1));
     }
 
     #[test]
