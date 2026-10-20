@@ -3,15 +3,19 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::DefaultTerminal;
+use ratatui::crossterm::cursor::SetCursorStyle;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::execute;
 
-use crate::engine::{Input, Session};
+use crate::config::{Caret, Config, ConfigFile, Mode};
+use crate::engine::{Input, Limit, Session};
 use crate::event::{AppEvent, Event, EventHandler};
-use crate::history::{History, Mode, Record};
+use crate::history::{History, Record};
+use crate::settings::{Setting, Step};
 use crate::stats::Results;
 use crate::{ui, words};
 
-const TEST_DURATION: Duration = Duration::from_secs(30);
+/// Words generated up front in time mode.
 const INITIAL_WORDS: usize = 100;
 const EXTRA_WORDS: usize = 50;
 /// Words left after the current one before more are appended.
@@ -28,6 +32,7 @@ enum SaveError {
 #[derive(Debug)]
 pub enum Screen {
     Typing,
+    Settings { selected: Setting },
     Results(Results),
 }
 
@@ -36,19 +41,28 @@ pub struct App {
     running: bool,
     pub(crate) screen: Screen,
     pub(crate) session: Session,
+    pub(crate) config: Config,
     /// Problem shown on the results screen, e.g. history could not be saved.
     pub(crate) notice: Option<String>,
+    /// Problem loading or saving the config, shown until it is resolved.
+    pub(crate) config_notice: Option<String>,
+    /// Where settings are saved; `None` when they cannot be, e.g. the file failed to load.
+    pub(crate) config_file: Option<ConfigFile>,
     history: Option<History>,
     events: EventHandler,
 }
 
 impl App {
     pub fn new() -> Self {
+        let (config, config_file, config_notice) = load_config();
         Self {
             running: true,
             screen: Screen::Typing,
-            session: new_session(),
+            session: new_session(&config),
+            config,
             notice: None,
+            config_notice,
+            config_file,
             history: History::in_data_dir(),
             events: EventHandler::new(),
         }
@@ -58,10 +72,19 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns an error if drawing fails or the terminal stops delivering events.
+    /// Returns an error if drawing or setting the cursor style fails, or the terminal stops
+    /// delivering events.
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         let mut redraw = true;
+        // style last sent to the terminal
+        let mut cursor = None;
         while self.running {
+            if let Some(style) = cursor_style(self.config.caret, self.config.caret_blink)
+                && cursor != Some(style)
+            {
+                execute!(terminal.backend_mut(), style)?;
+                cursor = Some(style);
+            }
             if redraw {
                 terminal.draw(|frame| ui::draw(&self, frame))?;
             }
@@ -101,21 +124,62 @@ impl App {
             return;
         }
         match (&self.screen, key.code) {
-            (_, KeyCode::Esc) => self.events.send(AppEvent::Quit),
+            (Screen::Typing | Screen::Results(_), KeyCode::Esc) => {
+                self.screen = Screen::Settings {
+                    selected: Setting::Mode,
+                };
+            }
             (Screen::Typing, KeyCode::Tab)
-            | (Screen::Results(_), KeyCode::Tab | KeyCode::Enter) => self.restart(),
+            | (Screen::Results(_), KeyCode::Tab | KeyCode::Enter)
+            | (Screen::Settings { .. }, KeyCode::Esc) => self.restart(),
+            (Screen::Results(_) | Screen::Settings { .. }, KeyCode::Char('q')) => {
+                self.events.send(AppEvent::Quit);
+            }
             (Screen::Typing, _) => {
                 if let Some(input) = typing_input(key) {
                     self.input(input);
                 }
             }
+            (&Screen::Settings { selected }, code) => self.settings_key(selected, code),
             (Screen::Results(_), _) => {}
+        }
+    }
+
+    fn settings_key(&mut self, selected: Setting, code: KeyCode) {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.screen = Screen::Settings {
+                    selected: selected.step(Step::Prev),
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.screen = Screen::Settings {
+                    selected: selected.step(Step::Next),
+                };
+            }
+            KeyCode::Left | KeyCode::Char('h') => self.change(selected, Step::Prev),
+            KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::Enter => {
+                self.change(selected, Step::Next);
+            }
+            _ => {}
+        }
+    }
+
+    fn change(&mut self, setting: Setting, direction: Step) {
+        setting.cycle(&mut self.config, direction);
+        if let Some(file) = &self.config_file {
+            self.config_notice = file
+                .save(&self.config)
+                .err()
+                .map(|e| format!("settings not saved to {}: {e}", file.path().display()));
         }
     }
 
     fn input(&mut self, input: Input) {
         self.session.handle(input, Instant::now());
-        if self.session.remaining_words() < EXTEND_THRESHOLD {
+        if matches!(self.session.limit(), Limit::Time(_))
+            && self.session.remaining_words() < EXTEND_THRESHOLD
+        {
             let more = words::random_words(&mut rand::rng(), EXTRA_WORDS).join(" ");
             self.session.extend(&more);
         }
@@ -137,12 +201,17 @@ impl App {
 
     fn save(&self, results: &Results) -> Result<(), SaveError> {
         let history = self.history.as_ref().ok_or(SaveError::NoDataDir)?;
+        let (mode, words) = match self.session.limit() {
+            Limit::Time(_) => (Mode::Time, None),
+            Limit::Words => (Mode::Words, Some(self.session.words().len())),
+        };
         let record = Record {
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
-            mode: Mode::Time,
+            mode,
             duration_secs: results.duration.as_secs(),
+            words,
             wpm: results.net_wpm,
             raw: results.raw_wpm,
             accuracy: results.accuracy,
@@ -154,7 +223,7 @@ impl App {
     }
 
     fn restart(&mut self) {
-        self.session = new_session();
+        self.session = new_session(&self.config);
         self.notice = None;
         self.screen = Screen::Typing;
     }
@@ -166,9 +235,43 @@ impl Default for App {
     }
 }
 
-fn new_session() -> Session {
-    let text = words::random_words(&mut rand::rng(), INITIAL_WORDS).join(" ");
-    Session::new(&text, TEST_DURATION)
+/// The config file's settings, the file to save changes to, and any problem to report.
+fn load_config() -> (Config, Option<ConfigFile>, Option<String>) {
+    let Some(file) = ConfigFile::in_config_dir() else {
+        let notice = "settings won't be saved: no config directory found";
+        return (Config::default(), None, Some(notice.to_owned()));
+    };
+    match file.load() {
+        Ok(config) => (config, Some(file), None),
+        // saving would overwrite the user's file, so it is left alone until they fix it
+        Err(e) => (
+            Config::default(),
+            None,
+            Some(format!("{e}; settings won't be saved")),
+        ),
+    }
+}
+
+fn new_session(config: &Config) -> Session {
+    let (count, limit) = match config.mode {
+        Mode::Time => (INITIAL_WORDS, Limit::Time(Duration::from_secs(config.time))),
+        Mode::Words => (config.words, Limit::Words),
+    };
+    let text = words::random_words(&mut rand::rng(), count).join(" ");
+    Session::new(&text, limit).with_rules(config.rules())
+}
+
+fn cursor_style(caret: Caret, blink: bool) -> Option<SetCursorStyle> {
+    let style = match (caret, blink) {
+        (Caret::Off, _) => return None,
+        (Caret::Block, false) => SetCursorStyle::SteadyBlock,
+        (Caret::Block, true) => SetCursorStyle::BlinkingBlock,
+        (Caret::Bar, false) => SetCursorStyle::SteadyBar,
+        (Caret::Bar, true) => SetCursorStyle::BlinkingBar,
+        (Caret::Underline, false) => SetCursorStyle::SteadyUnderScore,
+        (Caret::Underline, true) => SetCursorStyle::BlinkingUnderScore,
+    };
+    Some(style)
 }
 
 /// Only a running timer changes the screen between key presses.
@@ -206,6 +309,99 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
+    /// An app that touches neither the user's config nor their history.
+    fn app(config: Config) -> App {
+        App {
+            running: true,
+            screen: Screen::Typing,
+            session: new_session(&config),
+            config,
+            notice: None,
+            config_notice: None,
+            config_file: None,
+            history: None,
+            events: EventHandler::new(),
+        }
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key_event(key(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn esc_opens_settings_and_returns_with_new_mode() {
+        let mut app = app(Config::default());
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(
+            app.screen,
+            Screen::Settings {
+                selected: Setting::Mode
+            }
+        ));
+
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.config.mode, Mode::Words);
+        assert_eq!(app.session.limit(), Limit::Time(Duration::from_secs(30)));
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Typing));
+        assert_eq!(app.session.limit(), Limit::Words);
+        assert_eq!(app.session.words().len(), app.config.words);
+    }
+
+    #[test]
+    fn settings_selection_wraps() {
+        let mut app = app(Config::default());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Up);
+        assert!(matches!(
+            app.screen,
+            Screen::Settings {
+                selected: Setting::KeyTips
+            }
+        ));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(matches!(
+            app.screen,
+            Screen::Settings {
+                selected: Setting::Mode
+            }
+        ));
+    }
+
+    #[test]
+    fn words_mode_finishes_after_last_word() {
+        let mut app = app(Config {
+            mode: Mode::Words,
+            words: 3,
+            ..Config::default()
+        });
+        let target: Vec<String> = app.session.words().iter().map(|w| w.concat()).collect();
+        for c in target.join(" ").chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        assert!(matches!(app.screen, Screen::Results(_)));
+        assert_eq!(app.session.words().len(), 3);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("history not saved: no data directory found")
+        );
+    }
+
+    #[test]
+    fn hidden_caret_sets_no_cursor_style() {
+        assert_eq!(cursor_style(Caret::Off, true), None);
+    }
+
+    #[test]
+    fn blinking_bar_sets_blinking_cursor_style() {
+        assert_eq!(
+            cursor_style(Caret::Bar, true),
+            Some(SetCursorStyle::BlinkingBar)
+        );
+    }
+
     #[test]
     fn delete_word_shortcuts() {
         for event in [
@@ -236,7 +432,7 @@ mod tests {
 
     #[test]
     fn ticks_redraw_only_while_timer_runs() {
-        let mut session = new_session();
+        let mut session = new_session(&Config::default());
         assert!(!tick_needs_redraw(&Screen::Typing, &session));
 
         session.handle(Input::Char('a'), Instant::now());

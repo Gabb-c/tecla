@@ -7,11 +7,7 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    Time,
-}
+use crate::config::Mode;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -19,6 +15,9 @@ pub struct Record {
     pub timestamp: u64,
     pub mode: Mode,
     pub duration_secs: u64,
+    /// Target word count in [`Mode::Words`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub words: Option<usize>,
     pub wpm: f64,
     pub raw: f64,
     pub accuracy: f64,
@@ -107,6 +106,7 @@ mod tests {
             timestamp: 1_760_000_000,
             mode: Mode::Time,
             duration_secs: 30,
+            words: None,
             wpm,
             raw: wpm + 5.5,
             accuracy: 97.25,
@@ -123,6 +123,25 @@ mod tests {
 
         let read = history.read().expect("read");
         assert_eq!(read, [record(60.0), record(72.4)]);
+    }
+
+    #[test]
+    fn words_field_is_optional() {
+        let dir = TempDir::new("words-field");
+        fs::create_dir_all(&dir.0).expect("create dir");
+        let history = History::new(dir.0.join("history.jsonl"));
+        let old = r#"{"timestamp":1,"mode":"time","duration_secs":30,"wpm":1.0,"raw":1.0,"accuracy":1.0}"#;
+        fs::write(history.path(), format!("{old}\n")).expect("write");
+        let words = Record {
+            mode: Mode::Words,
+            words: Some(25),
+            ..record(50.0)
+        };
+        history.append(&words).expect("append");
+
+        let read = history.read().expect("read");
+        assert_eq!(read[0].words, None);
+        assert_eq!(read[1], words);
     }
 
     #[test]

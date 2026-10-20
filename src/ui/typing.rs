@@ -9,35 +9,42 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
+use crate::config::Config;
 use crate::engine::{LetterState, Session};
+use crate::stats::Live;
 
 const MAX_WIDTH: u16 = 80;
 const VISIBLE_LINES: u16 = 3;
 
-/// The typing screen: timer, wrapped target text and key hints.
+/// The typing screen: progress and live stats, wrapped target text, key hints and any notice.
 pub struct TypingView<'a> {
     pub session: &'a Session,
+    pub config: &'a Config,
     pub now: Instant,
+    pub notice: Option<&'a str>,
 }
 
 impl Widget for TypingView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let [timer, text, hints] = layout(area);
-        Line::from(seconds(self.session.remaining(self.now)).to_string())
-            .yellow()
-            .render(timer, buf);
+        let [status, text, hints, notice] = layout(area);
+        self.status_line().render(status, buf);
         Paragraph::new(self.visible_lines(text.width)).render(text, buf);
-        Line::from("tab restart · esc quit")
-            .dark_gray()
-            .centered()
-            .render(hints, buf);
+        if self.config.key_tips {
+            Line::from("tab restart · esc settings")
+                .dark_gray()
+                .centered()
+                .render(hints, buf);
+        }
+        if let Some(text) = self.notice {
+            Line::from(text).red().centered().render(notice, buf);
+        }
     }
 }
 
 impl TypingView<'_> {
     /// Where the terminal cursor should sit when rendered into `area`, if the caret is visible.
     pub fn caret_position(&self, area: Rect) -> Option<Position> {
-        let [_, text, _] = layout(area);
+        let [_, text, _, _] = layout(area);
         let (cells, caret) = self.cells();
         let graphemes = graphemes(&cells);
         visible_ranges(&graphemes, caret, text.width)
@@ -54,10 +61,45 @@ impl TypingView<'_> {
             })
     }
 
+    /// Progress, then whichever live stats are enabled once the test has started.
+    fn status_line(&self) -> Line<'static> {
+        let config = self.config;
+        let session = self.session;
+        let mut spans = Vec::new();
+        if config.live_progress {
+            let progress = match session.remaining(self.now) {
+                Some(remaining) => seconds(remaining).to_string(),
+                None => format!("{}/{}", session.current_word(), session.words().len()),
+            };
+            spans.push(Span::from(progress).yellow());
+        }
+        if session.is_started() && (config.live_wpm || config.live_accuracy || config.live_errors) {
+            let live = Live::at(session, self.now);
+            let mut stats = Vec::new();
+            if config.live_wpm {
+                stats.push(format!("{:.0} wpm", live.wpm));
+            }
+            if config.live_accuracy {
+                stats.push(format!("{:.0}% acc", live.accuracy));
+            }
+            if config.live_errors {
+                stats.push(format!("{} err", live.errors));
+            }
+            for stat in stats {
+                if !spans.is_empty() {
+                    spans.push(Span::from("  "));
+                }
+                spans.push(Span::from(stat).dark_gray());
+            }
+        }
+        Line::from(spans)
+    }
+
     /// Every word's target letters followed by its extra letters, separated by spaces, along
     /// with the index of the caret.
     fn cells(&self) -> (Vec<Cell<'_>>, usize) {
         let session = self.session;
+        let blind = self.config.blind;
         let mut cells = Vec::new();
         let mut caret = 0;
         for (word, letters) in session.words().iter().enumerate() {
@@ -68,11 +110,16 @@ impl TypingView<'_> {
                 caret = cells.len() + session.typed()[word].len();
             }
             for (letter, grapheme) in letters.iter().enumerate() {
-                let style = letter_style(session.letter_state(word, letter));
+                let style = letter_style(session.letter_state(word, letter), blind);
                 cells.push(Cell::new(grapheme, style));
             }
+            let extra = if blind {
+                Style::new()
+            } else {
+                Style::new().red().dim()
+            };
             for grapheme in session.extra(word) {
-                cells.push(Cell::new(grapheme, Style::new().red().dim()));
+                cells.push(Cell::new(grapheme, extra));
             }
         }
         (cells, caret)
@@ -108,31 +155,35 @@ fn graphemes<'a>(cells: &[Cell<'a>]) -> Vec<&'a str> {
     cells.iter().map(|cell| cell.grapheme).collect()
 }
 
-fn letter_style(state: LetterState) -> Style {
+/// In blind mode mistakes look like correct letters, and missed ones like untyped letters.
+fn letter_style(state: LetterState, blind: bool) -> Style {
     match state {
         LetterState::Untyped => Style::new().dark_gray(),
+        LetterState::Missed if blind => Style::new().dark_gray(),
+        LetterState::Incorrect if blind => Style::new(),
         LetterState::Correct => Style::new(),
         LetterState::Incorrect => Style::new().red(),
         LetterState::Missed => Style::new().dark_gray().underlined(),
     }
 }
 
-/// Splits the typing screen into timer, text and hints rows.
-fn layout(area: Rect) -> [Rect; 3] {
+/// Splits the typing screen into status, text, hints and notice rows.
+fn layout(area: Rect) -> [Rect; 4] {
     let width = area.width.saturating_sub(4).min(MAX_WIDTH);
     let [column] = Layout::horizontal([Constraint::Length(width)])
         .flex(Flex::Center)
         .areas(area);
-    let [timer, _, text, _, hints] = Layout::vertical([
+    let [status, _, text, _, hints, notice] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(VISIBLE_LINES),
         Constraint::Length(1),
         Constraint::Length(1),
+        Constraint::Length(1),
     ])
     .flex(Flex::Center)
     .areas(column);
-    [timer, text, hints]
+    [status, text, hints, notice]
 }
 
 /// The wrapped lines that fit on screen while keeping `cursor` visible.
@@ -190,25 +241,44 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, style::Modifier};
 
     use super::*;
-    use crate::engine::Input;
+    use crate::engine::{Input, Limit};
 
-    fn buffer(session: &Session, now: Instant, width: u16, height: u16) -> Buffer {
+    const LIMIT: Limit = Limit::Time(Duration::from_secs(30));
+
+    fn view<'a>(session: &'a Session, config: &'a Config, now: Instant) -> TypingView<'a> {
+        TypingView {
+            session,
+            config,
+            now,
+            notice: None,
+        }
+    }
+
+    fn draw(view: TypingView<'_>, width: u16, height: u16) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal
-            .draw(|frame| frame.render_widget(TypingView { session, now }, frame.area()))
+            .draw(|frame| frame.render_widget(view, frame.area()))
             .expect("draw");
         terminal.backend().buffer().clone()
     }
 
-    fn rendered(session: &Session, now: Instant, width: u16, height: u16) -> Vec<String> {
-        let buffer = buffer(session, now, width, height);
-        (0..height)
-            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+    fn lines(buffer: &Buffer) -> Vec<String> {
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol()).collect())
             .collect()
     }
 
+    fn buffer(session: &Session, now: Instant, width: u16, height: u16) -> Buffer {
+        draw(view(session, &Config::default(), now), width, height)
+    }
+
+    fn rendered(session: &Session, now: Instant, width: u16, height: u16) -> Vec<String> {
+        lines(&buffer(session, now, width, height))
+    }
+
     fn typed_session(target: &str, input: &str, now: Instant) -> Session {
-        let mut session = Session::new(target, Duration::from_secs(30));
+        let mut session = Session::new(target, LIMIT);
         for c in input.chars() {
             session.handle(Input::Char(c), now);
         }
@@ -218,7 +288,7 @@ mod tests {
     #[test]
     fn shows_target_text_and_timer() {
         let now = Instant::now();
-        let session = Session::new("hello world", Duration::from_secs(30));
+        let session = Session::new("hello world", LIMIT);
         let screen = rendered(&session, now, 40, 10).join("\n");
 
         assert!(screen.contains("hello world"), "{screen}");
@@ -228,7 +298,7 @@ mod tests {
     #[test]
     fn timer_counts_down_after_first_key() {
         let start = Instant::now();
-        let mut session = Session::new("hello world", Duration::from_secs(30));
+        let mut session = Session::new("hello world", LIMIT);
         session.handle(Input::Char('h'), start);
         let screen = rendered(&session, start + Duration::from_millis(5500), 40, 10).join("\n");
 
@@ -239,7 +309,7 @@ mod tests {
     fn scrolls_to_keep_cursor_visible() {
         let now = Instant::now();
         let text = "aaaa bbbb cccc dddd eeee ffff";
-        let mut session = Session::new(text, Duration::from_secs(30));
+        let mut session = Session::new(text, LIMIT);
         for c in "aaaa bbbb cccc dddd ".chars() {
             session.handle(Input::Char(c), now);
         }
@@ -252,7 +322,7 @@ mod tests {
     #[test]
     fn caret_sits_on_next_grapheme() {
         let now = Instant::now();
-        let mut session = Session::new("hello world", Duration::from_secs(30));
+        let mut session = Session::new("hello world", LIMIT);
         for c in "hello ".chars() {
             session.handle(Input::Char(c), now);
         }
@@ -263,12 +333,9 @@ mod tests {
             .expect("text row");
         let column = screen[row].find('w').expect("next grapheme");
 
-        let caret = TypingView {
-            session: &session,
-            now,
-        }
-        .caret_position(Rect::new(0, 0, 40, 10))
-        .expect("caret visible");
+        let caret = view(&session, &Config::default(), now)
+            .caret_position(Rect::new(0, 0, 40, 10))
+            .expect("caret visible");
 
         assert_eq!(
             caret,
@@ -279,19 +346,16 @@ mod tests {
     #[test]
     fn caret_follows_wrapped_line() {
         let now = Instant::now();
-        let mut session = Session::new("aaaa bbbb cccc", Duration::from_secs(30));
+        let mut session = Session::new("aaaa bbbb cccc", LIMIT);
         for c in "aaaa b".chars() {
             session.handle(Input::Char(c), now);
         }
         let area = Rect::new(0, 0, 9, 10);
-        let [_, text, _] = layout(area);
+        let [_, text, _, _] = layout(area);
 
-        let caret = TypingView {
-            session: &session,
-            now,
-        }
-        .caret_position(area)
-        .expect("caret visible");
+        let caret = view(&session, &Config::default(), now)
+            .caret_position(area)
+            .expect("caret visible");
 
         assert_eq!(caret, Position::new(text.x + 1, text.y + 1));
     }
@@ -307,12 +371,9 @@ mod tests {
             .expect("text row");
         let column = screen[row].find("abx").expect("word") + 3;
 
-        let caret = TypingView {
-            session: &session,
-            now,
-        }
-        .caret_position(Rect::new(0, 0, 40, 10))
-        .expect("caret visible");
+        let caret = view(&session, &Config::default(), now)
+            .caret_position(Rect::new(0, 0, 40, 10))
+            .expect("caret visible");
 
         assert_eq!(
             caret,
@@ -358,5 +419,73 @@ mod tests {
     fn overlong_word_gets_own_line() {
         let text: Vec<&str> = "a bcdefg h".split("").filter(|g| !g.is_empty()).collect();
         assert_eq!(wrap(&text, 3), [0..2, 2..9, 9..10]);
+    }
+
+    #[test]
+    fn words_mode_shows_word_progress() {
+        let now = Instant::now();
+        let mut session = Session::new("ab cd ef", Limit::Words);
+        for c in "ab c".chars() {
+            session.handle(Input::Char(c), now);
+        }
+        let screen = rendered(&session, now, 40, 10).join("\n");
+
+        assert!(screen.contains("1/3"), "{screen}");
+    }
+
+    #[test]
+    fn live_stats_follow_config() {
+        let now = Instant::now();
+        let session = typed_session("hello world", "hellx", now);
+        let config = Config {
+            live_progress: false,
+            live_accuracy: true,
+            live_errors: true,
+            ..Config::default()
+        };
+        let screen = lines(&draw(view(&session, &config, now), 40, 10)).join("\n");
+
+        assert!(screen.contains("80% acc  1 err"), "{screen}");
+        assert!(!screen.contains("wpm"), "{screen}");
+        assert!(!screen.contains("30"), "{screen}");
+    }
+
+    #[test]
+    fn key_tips_and_notice_can_show() {
+        let now = Instant::now();
+        let session = Session::new("hello world", LIMIT);
+        let config = Config {
+            key_tips: false,
+            ..Config::default()
+        };
+        let mut hidden = view(&session, &config, now);
+        hidden.notice = Some("config broken");
+        let screen = lines(&draw(hidden, 40, 10)).join("\n");
+
+        assert!(!screen.contains("tab restart"), "{screen}");
+        assert!(screen.contains("config broken"), "{screen}");
+        let screen = rendered(&session, now, 40, 10).join("\n");
+        assert!(screen.contains("tab restart"), "{screen}");
+    }
+
+    #[test]
+    fn blind_mode_hides_mistakes() {
+        let now = Instant::now();
+        let session = typed_session("abc", "axcz", now);
+        let config = Config {
+            blind: true,
+            ..Config::default()
+        };
+        let buffer = draw(view(&session, &config, now), 40, 10);
+        let screen = lines(&buffer);
+        let row = screen.iter().position(|l| l.contains("abcz")).expect("row");
+        let column = screen[row].find("abcz").expect("word");
+        for offset in 0..4 {
+            let cell = &buffer[(
+                u16::try_from(column + offset).unwrap(),
+                u16::try_from(row).unwrap(),
+            )];
+            assert_eq!(cell.fg, ratatui::style::Color::Reset, "offset {offset}");
+        }
     }
 }

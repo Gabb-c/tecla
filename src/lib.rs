@@ -1,7 +1,9 @@
 pub mod app;
+pub mod config;
 pub mod engine;
 pub mod event;
 pub mod history;
+pub mod settings;
 pub mod stats;
 pub mod ui;
 pub mod words;

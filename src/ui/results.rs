@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::time::Duration;
 
 use ratatui::{
     buffer::Buffer,
@@ -13,6 +14,8 @@ use crate::stats::Results;
 /// The results screen shown after a test ends.
 pub struct ResultsView<'a> {
     pub results: &'a Results,
+    /// Mode and length, e.g. "time 30".
+    pub test: String,
     /// Problem worth telling the user about, e.g. history could not be saved.
     pub notice: Option<&'a str>,
 }
@@ -21,6 +24,7 @@ impl Widget for ResultsView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let r = self.results;
         let mut lines = vec![
+            stat("test", self.test),
             stat("wpm", format!("{:.0}", r.net_wpm)),
             stat("raw", format!("{:.0}", r.raw_wpm)),
             stat("acc", format!("{:.1}%", r.accuracy)),
@@ -28,13 +32,13 @@ impl Widget for ResultsView<'_> {
             stat("incorrect", r.incorrect_chars),
             stat("extra", r.extra_chars),
             stat("missed", r.missed_chars),
-            stat("time", format!("{}s", r.duration.as_secs())),
+            stat("time", seconds(r.duration)),
             Line::default(),
         ];
         if let Some(notice) = self.notice {
             lines.push(Line::from(notice).red());
         }
-        lines.push(Line::from("tab/enter restart · esc quit").dark_gray());
+        lines.push(Line::from("tab/enter restart · esc settings · q quit").dark_gray());
 
         let text = Text::from(lines).centered();
         let height = u16::try_from(text.height()).unwrap_or(u16::MAX);
@@ -42,6 +46,15 @@ impl Widget for ResultsView<'_> {
             .flex(Flex::Center)
             .areas(area);
         text.render(area, buf);
+    }
+}
+
+/// Whole seconds when exact, as time tests are, else one decimal.
+fn seconds(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{:.1}s", duration.as_secs_f64())
     }
 }
 
@@ -54,8 +67,6 @@ fn stat(label: &str, value: impl Display) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
@@ -90,10 +101,12 @@ mod tests {
         let results = results();
         let screen = rendered(ResultsView {
             results: &results,
+            test: "time 30".to_owned(),
             notice: None,
         });
 
         for expected in [
+            "test time 30",
             "wpm 62",
             "raw 70",
             "acc 95.3%",
@@ -112,9 +125,16 @@ mod tests {
         let results = results();
         let screen = rendered(ResultsView {
             results: &results,
+            test: "time 30".to_owned(),
             notice: Some("history not saved"),
         });
 
         assert!(screen.contains("history not saved"), "{screen}");
+    }
+
+    #[test]
+    fn fractional_time_shows_a_decimal() {
+        assert_eq!(seconds(Duration::from_secs(30)), "30s");
+        assert_eq!(seconds(Duration::from_millis(12_430)), "12.4s");
     }
 }

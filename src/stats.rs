@@ -1,4 +1,4 @@
-//! Results computed from a finished [`Session`].
+//! Results computed from a [`Session`], when finished or live while it runs.
 //!
 //! A "character" is one grapheme cluster, and a word is five characters.
 //!
@@ -14,7 +14,7 @@
 //!
 //! Zero elapsed time yields 0 WPM, and zero character keystrokes yield 0% accuracy.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::engine::{Keystroke, LetterState, Session};
 
@@ -46,6 +46,30 @@ impl Results {
             extra_chars: tally.extra,
             missed_chars: tally.missed,
             duration,
+        }
+    }
+}
+
+/// Stats shown while a session is running.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Live {
+    pub wpm: f64,
+    /// Percentage in `0.0..=100.0`.
+    pub accuracy: f64,
+    /// Incorrect character keystrokes, including corrected ones.
+    pub errors: usize,
+}
+
+impl Live {
+    pub fn at(session: &Session, now: Instant) -> Self {
+        let keystrokes = session.keystrokes();
+        Self {
+            wpm: wpm(Tally::from_session(session).net, session.elapsed_at(now)),
+            accuracy: accuracy(keystrokes),
+            errors: keystrokes
+                .iter()
+                .filter(|key| matches!(key, Keystroke::Char { correct: false }))
+                .count(),
         }
     }
 }
@@ -118,14 +142,12 @@ pub fn accuracy(keystrokes: &[Keystroke]) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
-    use crate::engine::Input;
+    use crate::engine::{Input, Limit};
 
     fn finished(target: &str, inputs: &[Input], limit: Duration) -> Session {
         let start = Instant::now();
-        let mut session = Session::new(target, limit);
+        let mut session = Session::new(target, Limit::Time(limit));
         for &input in inputs {
             session.handle(input, start);
         }
@@ -207,12 +229,27 @@ mod tests {
 
     #[test]
     fn unstarted_session_gives_zero_results() {
-        let session = Session::new("abc", Duration::from_secs(30));
+        let session = Session::new("abc", Limit::Time(Duration::from_secs(30)));
         let results = Results::from_session(&session);
 
         assert_eq!(results.net_wpm, 0.0);
         assert_eq!(results.raw_wpm, 0.0);
         assert_eq!(results.accuracy, 0.0);
         assert!(results.net_wpm.is_finite() && results.accuracy.is_finite());
+    }
+
+    #[test]
+    fn live_stats_use_elapsed_time_so_far() {
+        let start = Instant::now();
+        let mut session = Session::new("hello world", Limit::Time(Duration::from_secs(60)));
+        for input in chars("hello wx") {
+            session.handle(input, start);
+        }
+        let live = Live::at(&session, start + Duration::from_secs(30));
+
+        // "hello " = 6 chars / 5 = 1.2 words in half a minute; "wx" is off track
+        assert_eq!(live.wpm, 2.4);
+        assert_eq!(live.errors, 1);
+        assert_eq!(live.accuracy, 87.5);
     }
 }

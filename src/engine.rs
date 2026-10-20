@@ -1,4 +1,4 @@
-//! A single timed typing session.
+//! A single typing session, limited by time or by its word count.
 //!
 //! Input is matched word by word, like Monkeytype. Letters are compared positionally within the
 //! current word, one grapheme cluster at a time; letters past the end of a word are extra, and
@@ -11,6 +11,69 @@ use unicode_segmentation::UnicodeSegmentation;
 
 /// Extra letters accepted past the end of a word.
 const MAX_EXTRA: usize = 10;
+
+/// What ends a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limit {
+    /// Ends when the time runs out; the caller keeps the words coming with [`Session::extend`].
+    Time(Duration),
+    /// Ends once the last target word is typed correctly, or space is pressed on it.
+    Words,
+}
+
+/// How far backspace may reach.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Confidence {
+    /// Backspace may return to a previous word that has a mistake.
+    #[default]
+    Off,
+    /// Backspace stays within the current word.
+    On,
+    /// Backspace does nothing.
+    Max,
+}
+
+impl Confidence {
+    pub const ALL: [Self; 3] = [Self::Off, Self::On, Self::Max];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// Whether mistakes block further input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StopOnError {
+    #[default]
+    Off,
+    /// Wrong letters are rejected, and space only moves on from a correct word.
+    Letter,
+    /// Wrong letters are accepted, but space only moves on from a correct word.
+    Word,
+}
+
+impl StopOnError {
+    pub const ALL: [Self; 3] = [Self::Off, Self::Letter, Self::Word];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Letter => "letter",
+            Self::Word => "word",
+        }
+    }
+}
+
+/// Optional input restrictions; a rejected keystroke still counts against accuracy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Rules {
+    pub confidence: Confidence,
+    pub stop_on_error: StopOnError,
+}
 
 /// Abstract user input fed into a [`Session`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,19 +115,27 @@ pub struct Session {
     /// Input for every word reached so far; the last entry is the current word.
     typed: Vec<Vec<String>>,
     keystrokes: Vec<Keystroke>,
-    duration: Duration,
+    limit: Limit,
+    rules: Rules,
     phase: Phase,
 }
 
 impl Session {
-    pub fn new(target: &str, duration: Duration) -> Self {
+    pub fn new(target: &str, limit: Limit) -> Self {
         Self {
             target: words(target),
             typed: vec![Vec::new()],
             keystrokes: Vec::new(),
-            duration,
+            limit,
+            rules: Rules::default(),
             phase: Phase::Waiting,
         }
+    }
+
+    #[must_use]
+    pub fn with_rules(mut self, rules: Rules) -> Self {
+        self.rules = rules;
+        self
     }
 
     /// Appends more target words, e.g. when the user is about to run out of words.
@@ -84,8 +155,11 @@ impl Session {
             (Phase::Waiting | Phase::Finished { .. }, _) => return,
         }
         match input {
-            Input::Char(c) if c.is_whitespace() => self.space(),
-            Input::Char(c) => self.type_char(c),
+            Input::Char(c) if c.is_whitespace() => self.space(now),
+            Input::Char(c) => {
+                self.type_char(c);
+                self.finish_if_last_word_done(now);
+            }
             Input::Backspace => self.backspace(),
             Input::DeleteWord => self.delete_word(),
         }
@@ -93,12 +167,10 @@ impl Session {
 
     /// Finishes the session once its time limit has passed.
     pub fn tick(&mut self, now: Instant) {
-        if let Phase::Running { started_at } = self.phase
-            && now.saturating_duration_since(started_at) >= self.duration
+        if let (Phase::Running { started_at }, Limit::Time(duration)) = (self.phase, self.limit)
+            && now.saturating_duration_since(started_at) >= duration
         {
-            self.phase = Phase::Finished {
-                elapsed: self.duration,
-            };
+            self.phase = Phase::Finished { elapsed: duration };
         }
     }
 
@@ -110,14 +182,12 @@ impl Session {
         !matches!(self.phase, Phase::Waiting)
     }
 
-    pub fn remaining(&self, now: Instant) -> Duration {
-        match self.phase {
-            Phase::Waiting => self.duration,
-            Phase::Running { started_at } => self
-                .duration
-                .saturating_sub(now.saturating_duration_since(started_at)),
-            Phase::Finished { .. } => Duration::ZERO,
-        }
+    /// Time left at `now`, or `None` when the session is not limited by time.
+    pub fn remaining(&self, now: Instant) -> Option<Duration> {
+        let Limit::Time(duration) = self.limit else {
+            return None;
+        };
+        Some(duration.saturating_sub(self.elapsed_at(now)))
     }
 
     /// Time spent typing; zero until the session has finished.
@@ -128,8 +198,17 @@ impl Session {
         }
     }
 
-    pub fn duration(&self) -> Duration {
-        self.duration
+    /// Time spent typing as of `now`.
+    pub fn elapsed_at(&self, now: Instant) -> Duration {
+        match self.phase {
+            Phase::Waiting => Duration::ZERO,
+            Phase::Running { started_at } => now.saturating_duration_since(started_at),
+            Phase::Finished { elapsed } => elapsed,
+        }
+    }
+
+    pub fn limit(&self) -> Limit {
+        self.limit
     }
 
     pub fn words(&self) -> &[Vec<String>] {
@@ -182,32 +261,64 @@ impl Session {
             return;
         };
         let typed = &mut self.typed[word];
-        if let Some(last) = typed.last_mut().filter(|last| joins(last, c)) {
-            last.push(c);
-        } else if typed.len() < target.len() + MAX_EXTRA {
-            typed.push(c.to_string());
-        } else {
-            return;
-        }
-        let index = typed.len() - 1;
+        let (index, letter) = match typed.last().filter(|last| joins(last, c)) {
+            Some(last) => (typed.len() - 1, format!("{last}{c}")),
+            None if typed.len() < target.len() + MAX_EXTRA => (typed.len(), c.to_string()),
+            None => return,
+        };
         // a partial cluster such as "e" before its combining accent is still on track
         let correct = target
             .get(index)
-            .is_some_and(|letter| letter.starts_with(typed[index].as_str()));
+            .is_some_and(|expected| expected.starts_with(letter.as_str()));
         self.keystrokes.push(Keystroke::Char { correct });
+        if !correct && self.rules.stop_on_error == StopOnError::Letter {
+            return;
+        }
+        if index < typed.len() {
+            typed[index] = letter;
+        } else {
+            typed.push(letter);
+        }
     }
 
-    fn space(&mut self) {
+    fn space(&mut self, now: Instant) {
         let word = self.current_word();
-        if self.typed[word].is_empty() || word + 1 >= self.target.len() {
+        let last = word + 1 >= self.target.len();
+        if self.typed[word].is_empty() || (last && self.limit != Limit::Words) {
             return;
         }
         let correct = self.is_word_correct(word);
         self.keystrokes.push(Keystroke::Char { correct });
-        self.typed.push(Vec::new());
+        if !correct && self.rules.stop_on_error != StopOnError::Off {
+            return;
+        }
+        if last {
+            self.finish(now);
+        } else {
+            self.typed.push(Vec::new());
+        }
+    }
+
+    fn finish_if_last_word_done(&mut self, now: Instant) {
+        let word = self.current_word();
+        if self.limit == Limit::Words && word + 1 == self.target.len() && self.is_word_correct(word)
+        {
+            self.finish(now);
+        }
+    }
+
+    fn finish(&mut self, now: Instant) {
+        if let Phase::Running { started_at } = self.phase {
+            self.phase = Phase::Finished {
+                elapsed: now.saturating_duration_since(started_at),
+            };
+        }
     }
 
     fn backspace(&mut self) {
+        if self.rules.confidence == Confidence::Max {
+            return;
+        }
         let word = self.current_word();
         if self.typed[word].pop().is_some() || self.step_back() {
             self.keystrokes.push(Keystroke::Backspace);
@@ -215,6 +326,9 @@ impl Session {
     }
 
     fn delete_word(&mut self) {
+        if self.rules.confidence == Confidence::Max {
+            return;
+        }
         let word = self.current_word();
         if self.typed[word].is_empty() && !self.step_back() {
             return;
@@ -227,7 +341,7 @@ impl Session {
     /// Returns to the end of the previous word, which is only allowed when it has a mistake.
     fn step_back(&mut self) -> bool {
         let word = self.current_word();
-        if word == 0 || self.is_word_correct(word - 1) {
+        if word == 0 || self.is_word_correct(word - 1) || self.rules.confidence != Confidence::Off {
             return false;
         }
         self.typed.pop();
@@ -252,7 +366,8 @@ fn joins(last: &str, c: char) -> bool {
 mod tests {
     use super::*;
 
-    const LIMIT: Duration = Duration::from_secs(30);
+    const SECS: Duration = Duration::from_secs(30);
+    const LIMIT: Limit = Limit::Time(SECS);
 
     fn type_str(session: &mut Session, text: &str, now: Instant) {
         for c in text.chars() {
@@ -501,24 +616,24 @@ mod tests {
         let t0 = Instant::now();
         let mut session = Session::new("abc", LIMIT);
 
-        session.tick(t0 + LIMIT * 2);
+        session.tick(t0 + SECS * 2);
         assert!(!session.is_started());
-        assert_eq!(session.remaining(t0 + LIMIT * 2), LIMIT);
+        assert_eq!(session.remaining(t0 + SECS * 2), Some(SECS));
 
         let start = t0 + Duration::from_secs(100);
         session.handle(Input::Char('a'), start);
         assert!(session.is_started());
         assert_eq!(
             session.remaining(start + Duration::from_secs(10)),
-            Duration::from_secs(20)
+            Some(Duration::from_secs(20))
         );
 
-        session.tick(start + LIMIT.saturating_sub(Duration::from_millis(1)));
+        session.tick(start + SECS.saturating_sub(Duration::from_millis(1)));
         assert!(!session.is_finished());
-        session.tick(start + LIMIT);
+        session.tick(start + SECS);
         assert!(session.is_finished());
-        assert_eq!(session.elapsed(), LIMIT);
-        assert_eq!(session.remaining(start + LIMIT), Duration::ZERO);
+        assert_eq!(session.elapsed(), SECS);
+        assert_eq!(session.remaining(start + SECS), Some(Duration::ZERO));
     }
 
     #[test]
@@ -528,11 +643,140 @@ mod tests {
         session.handle(Input::Char('a'), start);
 
         // the expired timer is noticed even without a tick in between
-        session.handle(Input::Char('b'), start + LIMIT);
+        session.handle(Input::Char('b'), start + SECS);
         assert!(session.is_finished());
-        session.handle(Input::Backspace, start + LIMIT);
+        session.handle(Input::Backspace, start + SECS);
 
         assert_eq!(typed(&session), ["a"]);
         assert_eq!(session.keystrokes().len(), 1);
+    }
+
+    fn with_rules(target: &str, rules: Rules) -> Session {
+        Session::new(target, LIMIT).with_rules(rules)
+    }
+
+    #[test]
+    fn words_mode_ends_when_last_word_is_correct() {
+        let start = Instant::now();
+        let mut session = Session::new("ab cd", Limit::Words);
+        session.handle(Input::Char('a'), start);
+        type_str(&mut session, "b c", start);
+        assert!(!session.is_finished());
+        assert_eq!(session.remaining(start), None);
+
+        let end = start + Duration::from_secs(7);
+        session.handle(Input::Char('d'), end);
+        assert!(session.is_finished());
+        assert_eq!(session.elapsed(), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn words_mode_ends_on_space_after_last_word() {
+        let start = Instant::now();
+        let mut session = Session::new("ab cd", Limit::Words);
+        type_str(&mut session, "ab cx", start);
+        assert!(!session.is_finished());
+
+        session.handle(Input::Char(' '), start + Duration::from_secs(3));
+        assert!(session.is_finished());
+        assert_eq!(session.elapsed(), Duration::from_secs(3));
+        assert_eq!(
+            session.keystrokes().last(),
+            Some(&Keystroke::Char { correct: false })
+        );
+    }
+
+    #[test]
+    fn words_mode_never_times_out() {
+        let start = Instant::now();
+        let mut session = Session::new("ab cd", Limit::Words);
+        session.handle(Input::Char('a'), start);
+        session.tick(start + Duration::from_secs(3600));
+
+        assert!(!session.is_finished());
+        assert_eq!(
+            session.elapsed_at(start + Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn confidence_on_keeps_backspace_in_current_word() {
+        let now = Instant::now();
+        let rules = Rules {
+            confidence: Confidence::On,
+            ..Rules::default()
+        };
+        let mut session = with_rules("ab cd", rules);
+        type_str(&mut session, "ax c", now);
+
+        session.handle(Input::Backspace, now);
+        session.handle(Input::Backspace, now);
+        session.handle(Input::DeleteWord, now);
+        assert_eq!(typed(&session), ["ax", ""]);
+        assert_eq!(session.current_word(), 1);
+    }
+
+    #[test]
+    fn confidence_max_disables_backspace() {
+        let now = Instant::now();
+        let rules = Rules {
+            confidence: Confidence::Max,
+            ..Rules::default()
+        };
+        let mut session = with_rules("abc", rules);
+        type_str(&mut session, "ax", now);
+
+        session.handle(Input::Backspace, now);
+        session.handle(Input::DeleteWord, now);
+        assert_eq!(typed(&session), ["ax"]);
+        assert!(!session.keystrokes().contains(&Keystroke::Backspace));
+    }
+
+    #[test]
+    fn stop_on_letter_rejects_wrong_letters() {
+        let now = Instant::now();
+        let rules = Rules {
+            stop_on_error: StopOnError::Letter,
+            ..Rules::default()
+        };
+        let mut session = with_rules("ab cd", rules);
+        type_str(&mut session, "axb", now);
+        assert_eq!(typed(&session), ["ab"]);
+    }
+
+    #[test]
+    fn stop_on_letter_blocks_space_after_wrong_word() {
+        let now = Instant::now();
+        let rules = Rules {
+            stop_on_error: StopOnError::Letter,
+            ..Rules::default()
+        };
+        let mut session = with_rules("ab cd", rules);
+        type_str(&mut session, "a ", now);
+        assert_eq!(typed(&session), ["a"]);
+        assert_eq!(
+            session.keystrokes(),
+            [
+                Keystroke::Char { correct: true },
+                Keystroke::Char { correct: false }
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_on_word_keeps_letters_but_blocks_space() {
+        let now = Instant::now();
+        let rules = Rules {
+            stop_on_error: StopOnError::Word,
+            ..Rules::default()
+        };
+        let mut session = with_rules("ab cd", rules);
+        type_str(&mut session, "ax ", now);
+        assert_eq!(typed(&session), ["ax"]);
+
+        session.handle(Input::Backspace, now);
+        type_str(&mut session, "b c", now);
+        assert_eq!(typed(&session), ["ab", "c"]);
     }
 }
