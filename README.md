@@ -20,21 +20,23 @@ cargo run --release
 
 ## Keybindings
 
-| Screen            | Key                                         | Action                    |
-| ----------------- | ------------------------------------------- | ------------------------- |
-| Typing            | any character                               | type                      |
-| Typing            | `Space`                                     | move to the next word     |
-| Typing            | `Backspace`                                 | delete the last character |
-| Typing            | `Ctrl-Backspace`, `Alt-Backspace`, `Ctrl-W` | delete the current word   |
-| Typing            | `Tab`                                       | restart with new words    |
-| Typing            | `Esc`                                       | open settings             |
-| Results           | `Tab`, `Enter`                              | start a new test          |
-| Results           | `Esc`                                       | open settings             |
-| Settings          | `↑`/`↓`, `k`/`j`                            | select a setting          |
-| Settings          | `←`/`→`, `h`/`l`, `Enter`, `Space`          | change its value          |
-| Settings          | `Esc`                                       | back to a new test        |
-| Results, Settings | `q`                                         | quit                      |
-| Any               | `Ctrl-C`                                    | quit                      |
+| Screen                     | Key                                         | Action                    |
+| -------------------------- | ------------------------------------------- | ------------------------- |
+| Typing                     | any character                               | type                      |
+| Typing                     | `Space`                                     | move to the next word     |
+| Typing                     | `Backspace`                                 | delete the last character |
+| Typing                     | `Ctrl-Backspace`, `Alt-Backspace`, `Ctrl-W` | delete the current word   |
+| Typing                     | `Tab`                                       | restart with new words    |
+| Typing                     | `Esc`                                       | open settings             |
+| Results, History           | `Tab`, `Enter`                              | start a new test          |
+| Results                    | `h`                                         | open history              |
+| Results                    | `Esc`                                       | open settings             |
+| History                    | `Esc`, `h`                                  | back to results           |
+| Settings                   | `↑`/`↓`, `k`/`j`                            | select a setting          |
+| Settings                   | `←`/`→`, `h`/`l`, `Enter`, `Space`          | change its value          |
+| Settings                   | `Esc`                                       | back to a new test        |
+| Results, History, Settings | `q`                                         | quit                      |
+| Any                        | `Ctrl-C`                                    | quit                      |
 
 Input is matched word by word, like Monkeytype. Letters typed past the end of a word stay in
 that word as extra letters, and pressing space moves on to the next word, leaving any skipped
@@ -84,19 +86,33 @@ A character is one grapheme cluster (so `é` counts once), and a word is five ch
 - **Accuracy**: correct keystrokes / total character keystrokes. A mistake you fix later still
   counts as a mistake. Backspace is not a character keystroke.
 
+- **Consistency**: how steady your raw speed stayed, from 0 to 100%. It is Monkeytype's
+  `kogasa(σ / μ)` over the raw WPM of each second, where
+  `kogasa(c) = 100 × (1 − tanh(c + c³/3 + c⁵/5))`, with three changes. Per-second values are not
+  rounded. The mean and deviation are weighted by interval length. A final interval under half a
+  second is merged into the one before it instead of being dropped. With equal one-second
+  intervals it matches Monkeytype. It shows `-` for tests under two seconds.
+
 The results screen also counts letters as correct, incorrect, extra (typed past the end of a
-word) and missed (skipped by moving on to the next word).
+word) and missed (skipped by moving on to the next word). Below the stats, a chart plots net WPM
+so far, raw WPM of each second, and the seconds with errors; it is hidden when the terminal is
+too short to fit it.
 
 ## History
 
 Each finished test is appended as one JSON line (timestamp, mode, duration, word count in words
-mode, wpm, raw, accuracy) to `history.jsonl` in the XDG data directory:
+mode, wpm, raw, accuracy, consistency when defined) to `history.jsonl` in the XDG data directory:
 
 | Platform     | Path                                                                |
 | ------------ | ------------------------------------------------------------------- |
 | Any          | `$XDG_DATA_HOME/tecla/history.jsonl`, when `XDG_DATA_HOME` is set   |
 | Linux, macOS | `~/.local/share/tecla/history.jsonl`                                |
 | Windows      | `%APPDATA%\tecla\history.jsonl`                                     |
+
+The results screen shows your personal best net WPM for the same test (mode and length), or
+`new pb!` when you beat it. Press `h` there to see one row per test: tests run, best, average of
+the last 10, and last WPM. Lines that are not valid records are skipped, and the history screen
+says how many.
 
 ## License
 

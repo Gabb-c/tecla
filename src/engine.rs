@@ -1,9 +1,9 @@
 //! A single typing session, limited by time or by its word count.
 //!
-//! Input is matched word by word, like Monkeytype. Letters are compared positionally within the
-//! current word, one grapheme cluster at a time; letters past the end of a word are extra, and
-//! space moves on to the next word, leaving any untyped letters missed. The caller supplies
-//! every timestamp so the session stays deterministic.
+//! Input is matched word by word. Letters are compared positionally within the current word,
+//! one grapheme cluster at a time; letters past the end of a word are extra, and space moves on
+//! to the next word, leaving any untyped letters missed. The caller supplies every timestamp so
+//! the session stays deterministic.
 
 use std::time::{Duration, Instant};
 

@@ -10,9 +10,9 @@ use ratatui::crossterm::execute;
 use crate::config::{Caret, Config, ConfigFile, Mode};
 use crate::engine::{Input, Limit, Session};
 use crate::event::{AppEvent, Event, EventHandler};
-use crate::history::{History, Record};
+use crate::history::{self, History, Pb, Record, Summary, Test};
 use crate::settings::{Setting, Step};
-use crate::stats::Results;
+use crate::stats::{Results, Timeline};
 use crate::{ui, words};
 
 /// Words generated up front in time mode.
@@ -29,11 +29,26 @@ enum SaveError {
     Write { path: PathBuf, source: io::Error },
 }
 
+/// A finished test, as shown on the results screen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Finished {
+    pub results: Results,
+    /// `None` when the result was not saved.
+    pub pb: Option<Pb>,
+}
+
 #[derive(Debug)]
 pub enum Screen {
     Typing,
-    Settings { selected: Setting },
-    Results(Results),
+    Settings {
+        selected: Setting,
+    },
+    Results(Finished),
+    /// Keeps the results to return to.
+    History {
+        finished: Finished,
+        summaries: Vec<Summary>,
+    },
 }
 
 #[derive(Debug)]
@@ -41,6 +56,8 @@ pub struct App {
     running: bool,
     pub(crate) screen: Screen,
     pub(crate) session: Session,
+    /// Samples of `session` for the results chart.
+    pub(crate) timeline: Timeline,
     pub(crate) config: Config,
     /// Problem shown on the results screen, e.g. history could not be saved.
     pub(crate) notice: Option<String>,
@@ -49,6 +66,11 @@ pub struct App {
     /// Where settings are saved; `None` when they cannot be, e.g. the file failed to load.
     pub(crate) config_file: Option<ConfigFile>,
     history: Option<History>,
+    /// Every saved result, oldest first; `None` when the history file exists but could not be
+    /// read.
+    pub(crate) records: Option<Vec<Record>>,
+    /// Problem reading the history, shown on the history screen.
+    pub(crate) history_notice: Option<String>,
     events: EventHandler,
 }
 
@@ -59,15 +81,20 @@ impl App {
     )]
     pub fn new() -> Self {
         let (config, config_file, config_notice) = load_config();
+        let history = History::in_data_dir();
+        let (records, history_notice) = load_history(history.as_ref());
         Self {
             running: true,
             screen: Screen::Typing,
             session: new_session(&config),
+            timeline: Timeline::default(),
             config,
             notice: None,
             config_notice,
             config_file,
-            history: History::in_data_dir(),
+            history,
+            records,
+            history_notice,
             events: EventHandler::new(),
         }
     }
@@ -134,10 +161,23 @@ impl App {
                 };
             }
             (Screen::Typing, KeyCode::Tab)
-            | (Screen::Results(_), KeyCode::Tab | KeyCode::Enter)
+            | (Screen::Results(_) | Screen::History { .. }, KeyCode::Tab | KeyCode::Enter)
             | (Screen::Settings { .. }, KeyCode::Esc) => self.restart(),
-            (Screen::Results(_) | Screen::Settings { .. }, KeyCode::Char('q')) => {
+            (
+                Screen::Results(_) | Screen::History { .. } | Screen::Settings { .. },
+                KeyCode::Char('q'),
+            ) => {
                 self.events.send(AppEvent::Quit);
+            }
+            (&Screen::Results(finished), KeyCode::Char('h')) => {
+                let summaries = history::summarize(self.records.as_deref().unwrap_or_default());
+                self.screen = Screen::History {
+                    finished,
+                    summaries,
+                };
+            }
+            (&Screen::History { finished, .. }, KeyCode::Esc | KeyCode::Char('h')) => {
+                self.screen = Screen::Results(finished);
             }
             (Screen::Typing, _) => {
                 if let Some(input) = typing_input(key) {
@@ -145,7 +185,7 @@ impl App {
                 }
             }
             (&Screen::Settings { selected }, code) => self.settings_key(selected, code),
-            (Screen::Results(_), _) => {}
+            (Screen::Results(_) | Screen::History { .. }, _) => {}
         }
     }
 
@@ -180,7 +220,10 @@ impl App {
     }
 
     fn input(&mut self, input: Input) {
-        self.session.handle(input, Instant::now());
+        let now = Instant::now();
+        // before the input, so a keystroke past a second boundary lands in the next second
+        self.timeline.observe(&self.session, now);
+        self.session.handle(input, now);
         if matches!(self.session.limit(), Limit::Time(_))
             && self.session.remaining_words() < EXTEND_THRESHOLD
         {
@@ -191,36 +234,47 @@ impl App {
     }
 
     fn tick(&mut self) {
-        self.session.tick(Instant::now());
+        let now = Instant::now();
+        self.session.tick(now);
+        self.timeline.observe(&self.session, now);
         self.finish_if_done();
     }
 
     fn finish_if_done(&mut self) {
         if matches!(self.screen, Screen::Typing) && self.session.is_finished() {
-            let results = Results::from_session(&self.session);
-            self.notice = self.save(&results).err().map(|e| e.to_string());
-            self.screen = Screen::Results(results);
+            self.timeline.finish(&self.session);
+            let results = Results::from_session(&self.session, &self.timeline);
+            let record = self.record(&results);
+            let pb = match self.save(&record) {
+                Ok(()) => self.add_record(record),
+                Err(e) => {
+                    self.notice = Some(e.to_string());
+                    None
+                }
+            };
+            self.screen = Screen::Results(Finished { results, pb });
         }
     }
 
-    fn save(&self, results: &Results) -> Result<(), SaveError> {
+    /// Adds a saved record and compares it with the previous best, unless the history could
+    /// not be read and so the best is unknown.
+    fn add_record(&mut self, record: Record) -> Option<Pb> {
+        let records = self.records.as_mut()?;
+        let pb = history::pb(records, &record);
+        records.push(record);
+        Some(pb)
+    }
+
+    fn record(&self, results: &Results) -> Record {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Record::new(Test::of(&self.session), timestamp, results)
+    }
+
+    fn save(&self, record: &Record) -> Result<(), SaveError> {
         let history = self.history.as_ref().ok_or(SaveError::NoDataDir)?;
-        let (mode, words) = match self.session.limit() {
-            Limit::Time(_) => (Mode::Time, None),
-            Limit::Words => (Mode::Words, Some(self.session.words().len())),
-        };
-        let record = Record {
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs()),
-            mode,
-            duration_secs: results.duration.as_secs(),
-            words,
-            wpm: results.net_wpm,
-            raw: results.raw_wpm,
-            accuracy: results.accuracy,
-        };
-        history.append(&record).map_err(|source| SaveError::Write {
+        history.append(record).map_err(|source| SaveError::Write {
             path: history.path().to_owned(),
             source,
         })
@@ -228,6 +282,7 @@ impl App {
 
     fn restart(&mut self) {
         self.session = new_session(&self.config);
+        self.timeline = Timeline::default();
         self.notice = None;
         self.screen = Screen::Typing;
     }
@@ -247,6 +302,29 @@ fn load_config() -> (Config, Option<ConfigFile>, Option<String>) {
             None,
             Some(format!("{e}; settings won't be saved")),
         ),
+    }
+}
+
+/// The saved results and any problem reading them.
+fn load_history(history: Option<&History>) -> (Option<Vec<Record>>, Option<String>) {
+    let Some(history) = history else {
+        return (Some(Vec::new()), Some(SaveError::NoDataDir.to_string()));
+    };
+    match history.read() {
+        Ok(loaded) => {
+            let notice = loaded.first_error.map(|first| {
+                format!(
+                    "{} unreadable lines skipped in {} ({first})",
+                    loaded.skipped,
+                    history.path().display()
+                )
+            });
+            (Some(loaded.records), notice)
+        }
+        Err(e) => {
+            let notice = format!("history not loaded from {}: {e}", history.path().display());
+            (None, Some(notice))
+        }
     }
 }
 
@@ -301,6 +379,7 @@ fn is_text(modifiers: KeyModifiers) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::TempDir;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -312,12 +391,47 @@ mod tests {
             running: true,
             screen: Screen::Typing,
             session: new_session(&config),
+            timeline: Timeline::default(),
             config,
             notice: None,
             config_notice: None,
             config_file: None,
             history: None,
+            records: Some(Vec::new()),
+            history_notice: None,
             events: EventHandler::detached(),
+        }
+    }
+
+    /// An app saving to a fresh history in `dir`.
+    fn app_with_history(config: Config, dir: &TempDir) -> App {
+        let history = History::new(dir.0.join("history.jsonl"));
+        App {
+            history: Some(history),
+            ..app(config)
+        }
+    }
+
+    fn three_words() -> Config {
+        Config {
+            mode: Mode::Words,
+            words: 3,
+            ..Config::default()
+        }
+    }
+
+    /// Types the session's words without mistakes, finishing a words test.
+    fn type_all(app: &mut App) {
+        let target: Vec<String> = app.session.words().iter().map(|w| w.concat()).collect();
+        for c in target.join(" ").chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    fn pb(app: &App) -> Option<Pb> {
+        match app.screen {
+            Screen::Results(Finished { pb, .. }) => pb,
+            ref screen => panic!("not on results: {screen:?}"),
         }
     }
 
@@ -368,15 +482,8 @@ mod tests {
 
     #[test]
     fn words_mode_finishes_after_last_word() {
-        let mut app = app(Config {
-            mode: Mode::Words,
-            words: 3,
-            ..Config::default()
-        });
-        let target: Vec<String> = app.session.words().iter().map(|w| w.concat()).collect();
-        for c in target.join(" ").chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
+        let mut app = app(three_words());
+        type_all(&mut app);
 
         assert!(matches!(app.screen, Screen::Results(_)));
         assert_eq!(app.session.words().len(), 3);
@@ -384,6 +491,130 @@ mod tests {
             app.notice.as_deref(),
             Some("history not saved: no data directory found")
         );
+    }
+
+    #[test]
+    fn first_saved_test_is_new_pb() {
+        let dir = TempDir::new("first-pb");
+        let mut app = app_with_history(three_words(), &dir);
+        type_all(&mut app);
+
+        assert_eq!(pb(&app), Some(Pb::New));
+    }
+
+    #[test]
+    fn saved_test_is_added_to_records() {
+        let dir = TempDir::new("added");
+        let mut app = app_with_history(three_words(), &dir);
+        type_all(&mut app);
+
+        assert_eq!(app.records.map(|r| r.len()), Some(1));
+    }
+
+    #[test]
+    fn unsaved_test_shows_no_pb() {
+        let mut app = app(three_words());
+        type_all(&mut app);
+
+        assert_eq!(pb(&app), None);
+    }
+
+    #[test]
+    fn unreadable_history_shows_no_pb() {
+        let dir = TempDir::new("unreadable");
+        let mut app = app_with_history(three_words(), &dir);
+        app.records = None;
+        type_all(&mut app);
+
+        assert_eq!(pb(&app), None);
+    }
+
+    #[test]
+    fn h_opens_history() {
+        let mut app = app(three_words());
+        type_all(&mut app);
+
+        press(&mut app, KeyCode::Char('h'));
+        assert!(matches!(app.screen, Screen::History { .. }));
+    }
+
+    #[test]
+    fn esc_from_history_returns_to_same_results() {
+        let mut app = app(three_words());
+        type_all(&mut app);
+        let Screen::Results(finished) = app.screen else {
+            panic!("not on results: {:?}", app.screen);
+        };
+        press(&mut app, KeyCode::Char('h'));
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Results(f) if f == finished));
+    }
+
+    /// A history file of two lines that are not records.
+    fn corrupt_history(dir: &TempDir) -> History {
+        std::fs::create_dir_all(&dir.0).expect("create dir");
+        let history = History::new(dir.0.join("history.jsonl"));
+        std::fs::write(history.path(), "bad\nworse\n").expect("write");
+        history
+    }
+
+    #[test]
+    fn load_history_keeps_records_when_lines_skipped() {
+        let dir = TempDir::new("skipped-records");
+        let (records, _) = load_history(Some(&corrupt_history(&dir)));
+        assert_eq!(records, Some(Vec::new()));
+    }
+
+    #[test]
+    fn load_history_reports_skipped_lines() {
+        let dir = TempDir::new("skipped-notice");
+        let (_, notice) = load_history(Some(&corrupt_history(&dir)));
+        assert!(
+            notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("2 unreadable lines skipped")),
+            "{notice:?}"
+        );
+    }
+
+    #[test]
+    fn load_history_without_data_dir_reports_notice() {
+        let (_, notice) = load_history(None);
+        assert_eq!(
+            notice.as_deref(),
+            Some("history not saved: no data directory found")
+        );
+    }
+
+    #[test]
+    fn finishing_samples_timeline() {
+        let mut app = app(three_words());
+        type_all(&mut app);
+
+        assert_ne!(app.timeline.samples(), []);
+    }
+
+    #[test]
+    fn restart_clears_timeline() {
+        let mut app = app(three_words());
+        type_all(&mut app);
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.timeline.samples(), []);
+    }
+
+    #[test]
+    fn saved_record_has_consistency_of_results() {
+        let dir = TempDir::new("consistency");
+        let mut app = app_with_history(three_words(), &dir);
+        type_all(&mut app);
+        let Screen::Results(Finished { results, .. }) = app.screen else {
+            panic!("not on results: {:?}", app.screen);
+        };
+
+        let saved = app.records.and_then(|r| r.last().map(|r| r.consistency));
+        assert_eq!(saved, Some(results.consistency));
     }
 
     #[test]
@@ -435,7 +666,10 @@ mod tests {
         session.handle(Input::Char('a'), Instant::now());
         assert!(tick_needs_redraw(&Screen::Typing, &session));
 
-        let results = Screen::Results(Results::from_session(&session));
+        let results = Screen::Results(Finished {
+            results: Results::from_session(&session, &Timeline::default()),
+            pb: None,
+        });
         assert!(!tick_needs_redraw(&results, &session));
     }
 

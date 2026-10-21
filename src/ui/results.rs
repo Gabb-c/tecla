@@ -9,44 +9,101 @@ use ratatui::{
     widgets::Widget,
 };
 
-use crate::stats::Results;
+use super::chart::WpmChart;
+use crate::history::{Pb, Test};
+use crate::stats::{Results, Timeline};
+
+/// Fewest rows worth drawing the chart in; shorter terminals show the stats alone.
+const CHART_MIN: u16 = 6;
+const CHART_MAX: u16 = 14;
+const CHART_WIDTH: u16 = 72;
 
 /// The results screen shown after a test ends.
 pub struct ResultsView<'a> {
     pub results: &'a Results,
-    /// Mode and length, e.g. "time 30".
-    pub test: String,
+    pub timeline: &'a Timeline,
+    pub test: Test,
+    /// `None` hides the personal best, e.g. when the result was not saved.
+    pub pb: Option<Pb>,
     /// Problem worth telling the user about, e.g. history could not be saved.
     pub notice: Option<&'a str>,
 }
 
 impl Widget for ResultsView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let stats = self.stats();
+        let footer = self.footer();
+        let chart = WpmChart {
+            timeline: self.timeline,
+        };
+        let stats_h = height(&stats);
+        let footer_h = height(&footer);
+        // one blank row above the chart and one above the footer
+        let room = area.height.saturating_sub(stats_h + footer_h + 2);
+        let chart_h = if chart.is_drawable() && room >= CHART_MIN {
+            room.min(CHART_MAX)
+        } else {
+            0
+        };
+        let [stats_area, _, chart_area, _, footer_area] = Layout::vertical([
+            Constraint::Length(stats_h),
+            Constraint::Length(u16::from(chart_h > 0)),
+            Constraint::Length(chart_h),
+            Constraint::Length(1),
+            Constraint::Length(footer_h),
+        ])
+        .flex(Flex::Center)
+        .areas(area);
+        let [chart_area] = Layout::horizontal([Constraint::Length(CHART_WIDTH)])
+            .flex(Flex::Center)
+            .areas(chart_area);
+
+        stats.render(stats_area, buf);
+        chart.render(chart_area, buf);
+        footer.render(footer_area, buf);
+    }
+}
+
+impl<'a> ResultsView<'a> {
+    fn stats(&self) -> Text<'static> {
         let r = self.results;
         let mut lines = vec![
             stat("test", self.test),
             stat("wpm", format!("{:.0}", r.net_wpm)),
+        ];
+        match self.pb {
+            Some(Pb::New) => lines.push(Line::from("new pb!").green().bold()),
+            Some(Pb::Standing(best)) => lines.push(stat("pb", format!("{best:.0}"))),
+            None => {}
+        }
+        let consistency = r
+            .consistency
+            .map_or_else(|| "-".to_owned(), |c| format!("{c:.0}%"));
+        lines.extend([
             stat("raw", format!("{:.0}", r.raw_wpm)),
             stat("acc", format!("{:.1}%", r.accuracy)),
+            stat("consistency", consistency),
             stat("correct", r.correct_chars),
             stat("incorrect", r.incorrect_chars),
             stat("extra", r.extra_chars),
             stat("missed", r.missed_chars),
             stat("time", seconds(r.duration)),
-            Line::default(),
-        ];
+        ]);
+        Text::from(lines).centered()
+    }
+
+    fn footer(&self) -> Text<'a> {
+        let mut lines = Vec::with_capacity(2);
         if let Some(notice) = self.notice {
             lines.push(Line::from(notice).red());
         }
-        lines.push(Line::from("tab/enter restart · esc settings · q quit").dark_gray());
-
-        let text = Text::from(lines).centered();
-        let height = u16::try_from(text.height()).unwrap_or(u16::MAX);
-        let [area] = Layout::vertical([Constraint::Length(height)])
-            .flex(Flex::Center)
-            .areas(area);
-        text.render(area, buf);
+        lines.push(Line::from("tab/enter restart · h history · esc settings · q quit").dark_gray());
+        Text::from(lines).centered()
     }
+}
+
+fn height(text: &Text) -> u16 {
+    u16::try_from(text.height()).unwrap_or(u16::MAX)
 }
 
 /// Whole seconds when exact, as time tests are, else one decimal.
@@ -60,16 +117,15 @@ fn seconds(duration: Duration) -> String {
 
 fn stat(label: &str, value: impl Display) -> Line<'static> {
     Line::from(vec![
-        format!("{label:>9} ").dark_gray(),
+        format!("{label:>11} ").dark_gray(),
         format!("{value:<9}").yellow().bold(),
     ])
 }
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{Terminal, backend::TestBackend};
-
     use super::*;
+    use crate::test_util::{render, steady_timeline};
 
     fn results() -> Results {
         Results {
@@ -81,19 +137,12 @@ mod tests {
             extra_chars: 2,
             missed_chars: 1,
             duration: Duration::from_secs(30),
+            consistency: Some(78.4),
         }
     }
 
     fn rendered(view: ResultsView<'_>) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(40, 15)).expect("terminal");
-        terminal
-            .draw(|frame| frame.render_widget(view, frame.area()))
-            .expect("draw");
-        let buffer = terminal.backend().buffer();
-        (0..15)
-            .map(|y| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
+        render(view, 60, 20)
     }
 
     #[test]
@@ -101,7 +150,9 @@ mod tests {
         let results = results();
         let screen = rendered(ResultsView {
             results: &results,
-            test: "time 30".to_owned(),
+            timeline: &Timeline::default(),
+            test: Test::Time(30),
+            pb: None,
             notice: None,
         });
 
@@ -115,6 +166,7 @@ mod tests {
             "extra 2",
             "missed 1",
             "time 30s",
+            "consistency 78%",
         ] {
             assert!(screen.contains(expected), "{expected:?} in\n{screen}");
         }
@@ -125,11 +177,106 @@ mod tests {
         let results = results();
         let screen = rendered(ResultsView {
             results: &results,
-            test: "time 30".to_owned(),
+            timeline: &Timeline::default(),
+            test: Test::Time(30),
+            pb: None,
             notice: Some("history not saved"),
         });
 
         assert!(screen.contains("history not saved"), "{screen}");
+    }
+
+    #[test]
+    fn shows_new_pb() {
+        let results = results();
+        let screen = rendered(ResultsView {
+            results: &results,
+            timeline: &Timeline::default(),
+            test: Test::Time(30),
+            pb: Some(Pb::New),
+            notice: None,
+        });
+
+        assert!(screen.contains("new pb!"), "{screen}");
+    }
+
+    #[test]
+    fn shows_standing_pb() {
+        let results = results();
+        let screen = rendered(ResultsView {
+            results: &results,
+            timeline: &Timeline::default(),
+            test: Test::Time(30),
+            pb: Some(Pb::Standing(87.4)),
+            notice: None,
+        });
+
+        assert!(screen.contains("pb 87"), "{screen}");
+    }
+
+    #[test]
+    fn undefined_consistency_shows_dash() {
+        let results = Results {
+            consistency: None,
+            ..results()
+        };
+        let screen = rendered(ResultsView {
+            results: &results,
+            timeline: &Timeline::default(),
+            test: Test::Time(30),
+            pb: None,
+            notice: None,
+        });
+
+        assert!(screen.contains("consistency -"), "{screen}");
+    }
+
+    #[test]
+    fn shows_chart_when_tall() {
+        let results = results();
+        let timeline = steady_timeline(30);
+        let screen = render(
+            ResultsView {
+                results: &results,
+                timeline: &timeline,
+                test: Test::Time(30),
+                pb: None,
+                notice: None,
+            },
+            80,
+            30,
+        );
+
+        assert!(screen.contains("30s"), "{screen}");
+    }
+
+    /// A full 30 second test's results in a terminal too short for the chart.
+    fn rendered_short() -> String {
+        let results = results();
+        let timeline = steady_timeline(30);
+        render(
+            ResultsView {
+                results: &results,
+                timeline: &timeline,
+                test: Test::Time(30),
+                pb: None,
+                notice: None,
+            },
+            80,
+            18,
+        )
+    }
+
+    #[test]
+    fn hides_chart_when_short() {
+        let screen = rendered_short();
+        assert!(!screen.contains("errors"), "{screen}");
+    }
+
+    #[test]
+    fn keeps_footer_when_short() {
+        let screen = rendered_short();
+        assert!(screen.contains("tab/enter restart"), "{screen}");
     }
 
     #[test]

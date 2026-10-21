@@ -1,3 +1,5 @@
+mod chart;
+mod history;
 mod results;
 mod settings;
 mod typing;
@@ -10,13 +12,14 @@ use ratatui::{
     widgets::{Block, BorderType},
 };
 
+pub use history::HistoryView;
 pub use results::ResultsView;
 pub use settings::SettingsView;
 pub use typing::TypingView;
 
-use crate::app::{App, Screen};
+use crate::app::{App, Finished, Screen};
 use crate::config::{Caret, ConfigFile};
-use crate::engine::Limit;
+use crate::history::Test;
 
 /// Renders the current screen and places the terminal cursor on the typing caret.
 pub fn draw(app: &App, frame: &mut Frame) {
@@ -49,20 +52,23 @@ pub fn draw(app: &App, frame: &mut Frame) {
             },
             area,
         ),
-        Screen::Results(results) => frame.render_widget(
+        Screen::Results(Finished { results, pb }) => frame.render_widget(
             ResultsView {
                 results,
-                test: test_name(app.session.limit(), app.session.words().len()),
+                timeline: &app.timeline,
+                test: Test::of(&app.session),
+                pb: *pb,
                 notice: app.notice.as_deref(),
             },
             area,
         ),
-    }
-}
-
-fn test_name(limit: Limit, words: usize) -> String {
-    match limit {
-        Limit::Time(duration) => format!("time {}", duration.as_secs()),
-        Limit::Words => format!("words {words}"),
+        Screen::History { summaries, .. } => frame.render_widget(
+            HistoryView {
+                summaries,
+                current: Test::of(&app.session),
+                notice: app.history_notice.as_deref(),
+            },
+            area,
+        ),
     }
 }
