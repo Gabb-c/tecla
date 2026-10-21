@@ -3,6 +3,7 @@ mod config;
 mod engine;
 mod event;
 mod history;
+mod keymap;
 mod paths;
 mod settings;
 mod stats;

@@ -40,11 +40,10 @@ impl Widget for HistoryView<'_> {
                 }
             }));
         }
-        lines.push(Line::default());
         if let Some(notice) = self.notice {
+            lines.push(Line::default());
             lines.push(Line::from(notice).red());
         }
-        lines.push(Line::from("esc/h back · tab/enter restart · q quit").dark_gray());
 
         let text = Text::from(lines).centered();
         let height = u16::try_from(text.height()).unwrap_or(u16::MAX);

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -9,17 +10,19 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
-use crate::config::Config;
+use crate::config::{Config, Mode};
 use crate::engine::{LetterState, Session};
+use crate::settings::Lengths;
 use crate::stats::Live;
 
 const MAX_WIDTH: u16 = 80;
 const VISIBLE_LINES: u16 = 3;
 
-/// The typing screen: progress and live stats, wrapped target text, key hints and any notice.
+/// The typing screen: the next test or live stats, wrapped target text and any notice.
 pub struct TypingView<'a> {
     pub session: &'a Session,
     pub config: &'a Config,
+    pub lengths: &'a Lengths,
     pub now: Instant,
     pub notice: Option<&'a str>,
 }
@@ -34,7 +37,7 @@ impl TypingView<'_> {
     /// Renders into `area` and returns where the terminal cursor belongs, if the caret is
     /// visible.
     pub fn render_with_caret(self, area: Rect, buf: &mut Buffer) -> Option<Position> {
-        let [status, text, hints, notice] = layout(area);
+        let [status, text, notice] = layout(area);
         self.status_line().render(status, buf);
 
         let (cells, caret) = self.cells();
@@ -52,22 +55,19 @@ impl TypingView<'_> {
             .collect();
         Paragraph::new(lines).render(text, buf);
 
-        if self.config.key_tips {
-            Line::from("tab restart · esc settings")
-                .dark_gray()
-                .centered()
-                .render(hints, buf);
-        }
         if let Some(text) = self.notice {
             Line::from(text).red().centered().render(notice, buf);
         }
         position
     }
 
-    /// Progress, then whichever live stats are enabled once the test has started.
+    /// The next test until it starts, then progress and whichever live stats are enabled.
     fn status_line(&self) -> Line<'static> {
         let config = self.config;
         let session = self.session;
+        if !session.is_started() {
+            return next_test(config, self.lengths);
+        }
         let mut spans = Vec::new();
         if config.live_progress {
             let progress = match session.remaining(self.now) {
@@ -76,7 +76,7 @@ impl TypingView<'_> {
             };
             spans.push(Span::from(progress).yellow());
         }
-        if session.is_started() && (config.live_wpm || config.live_accuracy || config.live_errors) {
+        if config.live_wpm || config.live_accuracy || config.live_errors {
             let live = Live::at(session, self.now);
             let mut stats = Vec::new();
             if config.live_wpm {
@@ -126,6 +126,34 @@ impl TypingView<'_> {
             }
         }
         (cells, caret)
+    }
+}
+
+/// The modes and the current mode's lengths, the selected ones highlighted.
+fn next_test(config: &Config, lengths: &Lengths) -> Line<'static> {
+    let modes = Mode::ALL
+        .into_iter()
+        .map(|mode| choice(mode.as_str(), mode == config.mode));
+    let lengths = lengths
+        .choices(config)
+        .into_iter()
+        .map(|length| choice(length.label, length.selected));
+    let mut spans: Vec<Span> = Vec::new();
+    for span in modes {
+        spans.extend([span, Span::raw("  ")]);
+    }
+    spans.push("│".dark_gray());
+    for span in lengths {
+        spans.extend([Span::raw("  "), span]);
+    }
+    Line::from(spans)
+}
+
+fn choice(label: impl Into<Cow<'static, str>>, selected: bool) -> Span<'static> {
+    if selected {
+        Span::from(label).yellow().bold()
+    } else {
+        Span::from(label).dark_gray()
     }
 }
 
@@ -185,23 +213,22 @@ fn caret_position(
     Some(Position::new(text.x + offset, text.y + row))
 }
 
-/// Splits the typing screen into status, text, hints and notice rows.
-fn layout(area: Rect) -> [Rect; 4] {
+/// Splits the typing screen into status, text and notice rows.
+fn layout(area: Rect) -> [Rect; 3] {
     let width = area.width.saturating_sub(4).min(MAX_WIDTH);
     let [column] = Layout::horizontal([Constraint::Length(width)])
         .flex(Flex::Center)
         .areas(area);
-    let [status, _, text, _, hints, notice] = Layout::vertical([
+    let [status, _, text, _, notice] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(VISIBLE_LINES),
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(1),
     ])
     .flex(Flex::Center)
     .areas(column);
-    [status, text, hints, notice]
+    [status, text, notice]
 }
 
 /// The wrapped lines that fit on screen while keeping `cursor` visible.
@@ -258,8 +285,12 @@ fn wrap(graphemes: &[&str], width: usize) -> Vec<Range<usize>> {
 mod tests {
     use ratatui::{Terminal, backend::TestBackend, style::Modifier};
 
+    use std::sync::LazyLock;
+
     use super::*;
     use crate::engine::{Input, Limit};
+
+    static LENGTHS: LazyLock<Lengths> = LazyLock::new(|| Lengths::new(&Config::default()));
 
     const LIMIT: Limit = Limit::Time(Duration::from_secs(30));
 
@@ -267,6 +298,7 @@ mod tests {
         TypingView {
             session,
             config,
+            lengths: &LENGTHS,
             now,
             notice: None,
         }
@@ -375,7 +407,7 @@ mod tests {
             session.handle(Input::Char(c), now);
         }
         let area = Rect::new(0, 0, 9, 10);
-        let [_, text, _, _] = layout(area);
+        let [_, text, _] = layout(area);
 
         let caret = caret(view(&session, &Config::default(), now), area).expect("caret visible");
 
@@ -390,7 +422,7 @@ mod tests {
             session.handle(Input::Char(c), now);
         }
         let area = Rect::new(0, 0, 40, 10);
-        let [_, text, _, _] = layout(area);
+        let [_, text, _] = layout(area);
 
         let caret = caret(view(&session, &Config::default(), now), area).expect("caret visible");
 
@@ -402,7 +434,7 @@ mod tests {
         let now = Instant::now();
         let session = typed_session("abcd efgh", "abcd", now);
         let area = Rect::new(0, 0, 8, 10);
-        let [_, text, _, _] = layout(area);
+        let [_, text, _] = layout(area);
 
         let caret = caret(view(&session, &Config::default(), now), area).expect("caret visible");
 
@@ -502,21 +534,36 @@ mod tests {
     }
 
     #[test]
-    fn key_tips_and_notice_can_show() {
+    fn shows_notice() {
         let now = Instant::now();
         let session = Session::new("hello world".split_whitespace(), LIMIT);
-        let config = Config {
-            key_tips: false,
-            ..Config::default()
-        };
-        let mut hidden = view(&session, &config, now);
-        hidden.notice = Some("config broken");
-        let screen = lines(&draw(hidden, 40, 10)).join("\n");
+        let config = Config::default();
+        let mut view = view(&session, &config, now);
+        view.notice = Some("config broken");
+        let screen = lines(&draw(view, 40, 10)).join("\n");
 
-        assert!(!screen.contains("tab restart"), "{screen}");
         assert!(screen.contains("config broken"), "{screen}");
-        let screen = rendered(&session, now, 40, 10).join("\n");
-        assert!(screen.contains("tab restart"), "{screen}");
+    }
+
+    #[test]
+    fn shows_next_test_before_start() {
+        let now = Instant::now();
+        let session = Session::new("hello world".split_whitespace(), LIMIT);
+        let screen = rendered(&session, now, 50, 10).join("\n");
+
+        assert!(
+            screen.contains("time  words  │  15  30  60  120"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn hides_next_test_once_started() {
+        let now = Instant::now();
+        let session = typed_session("hello world", "h", now);
+        let screen = rendered(&session, now, 50, 10).join("\n");
+
+        assert!(!screen.contains("words"), "{screen}");
     }
 
     #[test]

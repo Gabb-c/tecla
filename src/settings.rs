@@ -1,6 +1,7 @@
 //! The rows of the settings screen and how each one edits a [`Config`].
 
 use std::borrow::Cow;
+use std::fmt::Display;
 
 use crate::config::{Caret, Config, Mode};
 use crate::engine::{Confidence, StopOnError};
@@ -73,6 +74,45 @@ impl Setting {
         }
     }
 
+    pub fn section(self) -> Section {
+        match self {
+            Self::Mode | Self::Time | Self::Words => Section::Test,
+            Self::Caret | Self::CaretBlink => Section::Caret,
+            Self::LiveProgress | Self::LiveWpm | Self::LiveAccuracy | Self::LiveErrors => {
+                Section::LiveStats
+            }
+            Self::Confidence | Self::StopOnError | Self::Blind => Section::Difficulty,
+            Self::KeyTips => Section::Interface,
+        }
+    }
+
+    /// What the setting does, for its current value where the values differ in kind.
+    pub fn description(self, config: &Config) -> &'static str {
+        match self {
+            Self::Mode => "race the clock, or type a fixed number of words",
+            Self::Time => "length of a time test",
+            Self::Words => "length of a words test",
+            Self::Caret => "shape of the typing cursor",
+            Self::CaretBlink => "whether the typing cursor blinks",
+            Self::LiveProgress => "time left, or words typed, while you type",
+            Self::LiveWpm => "speed while you type",
+            Self::LiveAccuracy => "accuracy while you type",
+            Self::LiveErrors => "mistake count while you type",
+            Self::Confidence => match config.confidence {
+                Confidence::Off => "backspace may return to a previous word with a mistake",
+                Confidence::On => "backspace stays within the current word",
+                Confidence::Max => "backspace does nothing",
+            },
+            Self::StopOnError => match config.stop_on_error {
+                StopOnError::Off => "mistakes never block input",
+                StopOnError::Letter => "wrong letters are rejected; space needs a correct word",
+                StopOnError::Word => "wrong letters are kept; space needs a correct word",
+            },
+            Self::Blind => "hides mistakes while you type",
+            Self::KeyTips => "key hints on the typing screen",
+        }
+    }
+
     pub fn value(self, config: &Config) -> Cow<'static, str> {
         match self {
             Self::Mode => config.mode.as_str().into(),
@@ -103,11 +143,11 @@ impl Setting {
     }
 
     /// Moves the setting to its next or previous value, wrapping around.
-    pub fn cycle(self, config: &mut Config, direction: Step) {
+    pub fn cycle(self, config: &mut Config, lengths: &Lengths, direction: Step) {
         match self {
             Self::Mode => config.mode = step(&Mode::ALL, config.mode, direction),
-            Self::Time => config.time = step_preset(&TIME_PRESETS, config.time, direction),
-            Self::Words => config.words = step_preset(&WORD_PRESETS, config.words, direction),
+            Self::Time => config.time = step(&lengths.time, config.time, direction),
+            Self::Words => config.words = step(&lengths.words, config.words, direction),
             Self::Caret => config.caret = step(&Caret::ALL, config.caret, direction),
             Self::Confidence => {
                 config.confidence = step(&Confidence::ALL, config.confidence, direction);
@@ -126,6 +166,79 @@ impl Setting {
     }
 }
 
+/// A group of related rows on the settings screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Test,
+    Caret,
+    LiveStats,
+    Difficulty,
+    Interface,
+}
+
+impl Section {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Caret => "caret",
+            Self::LiveStats => "live stats",
+            Self::Difficulty => "difficulty",
+            Self::Interface => "interface",
+        }
+    }
+}
+
+/// The lengths each mode cycles through: the presets, with a custom length the config file
+/// started with kept in order among them for the whole session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lengths {
+    time: Vec<u64>,
+    words: Vec<usize>,
+}
+
+impl Lengths {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            time: merged(&TIME_PRESETS, config.time),
+            words: merged(&WORD_PRESETS, config.words),
+        }
+    }
+
+    /// The current mode's lengths, the one in `config` selected.
+    pub fn choices(&self, config: &Config) -> Vec<Choice> {
+        match config.mode {
+            Mode::Time => choices(&self.time, config.time),
+            Mode::Words => choices(&self.words, config.words),
+        }
+    }
+}
+
+/// One length of the next test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub label: String,
+    pub selected: bool,
+}
+
+/// `presets`, which must be sorted, with `custom` inserted in order.
+fn merged<T: Copy + Ord>(presets: &[T], custom: T) -> Vec<T> {
+    let mut values = presets.to_vec();
+    if let Err(index) = values.binary_search(&custom) {
+        values.insert(index, custom);
+    }
+    values
+}
+
+fn choices<T: Copy + PartialEq + Display>(values: &[T], current: T) -> Vec<Choice> {
+    values
+        .iter()
+        .map(|&value| Choice {
+            label: value.to_string(),
+            selected: value == current,
+        })
+        .collect()
+}
+
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
@@ -137,16 +250,6 @@ fn step<T: Copy + PartialEq>(all: &[T], current: T, direction: Step) -> T {
         Step::Prev => (index + all.len() - 1) % all.len(),
     };
     all[next]
-}
-
-/// Like [`step`], but a custom value from the config file moves to the nearest preset in the
-/// chosen direction.
-fn step_preset<T: Copy + Ord>(presets: &[T], current: T, direction: Step) -> T {
-    let (found, wrapped) = match direction {
-        Step::Next => (presets.iter().find(|&&p| p > current), presets.first()),
-        Step::Prev => (presets.iter().rev().find(|&&p| p < current), presets.last()),
-    };
-    found.or(wrapped).copied().unwrap_or(current)
 }
 
 #[cfg(test)]
@@ -185,48 +288,102 @@ mod tests {
     #[test]
     fn cycles_wrap_both_ways() {
         let mut config = Config::default();
-        Setting::Caret.cycle(&mut config, Step::Prev);
+        let lengths = Lengths::new(&config);
+        Setting::Caret.cycle(&mut config, &lengths, Step::Prev);
         assert_eq!(config.caret, Caret::Off);
-        Setting::Caret.cycle(&mut config, Step::Next);
+        Setting::Caret.cycle(&mut config, &lengths, Step::Next);
         assert_eq!(config.caret, Caret::Block);
 
         config.time = 120;
-        Setting::Time.cycle(&mut config, Step::Next);
+        Setting::Time.cycle(&mut config, &lengths, Step::Next);
         assert_eq!(config.time, 15);
-        Setting::Time.cycle(&mut config, Step::Prev);
+        Setting::Time.cycle(&mut config, &lengths, Step::Prev);
         assert_eq!(config.time, 120);
     }
 
     #[test]
-    fn custom_length_moves_to_nearest_preset() {
+    fn presets_are_sorted() {
+        assert!(TIME_PRESETS.is_sorted());
+        assert!(WORD_PRESETS.is_sorted());
+    }
+
+    #[test]
+    fn custom_length_stays_in_the_cycle() {
         let mut config = Config {
             words: 40,
             ..Config::default()
         };
-        Setting::Words.cycle(&mut config, Step::Next);
+        let lengths = Lengths::new(&config);
+        Setting::Words.cycle(&mut config, &lengths, Step::Next);
         assert_eq!(config.words, 50);
 
-        config.words = 40;
-        Setting::Words.cycle(&mut config, Step::Prev);
-        assert_eq!(config.words, 25);
+        Setting::Words.cycle(&mut config, &lengths, Step::Prev);
+        assert_eq!(config.words, 40);
     }
 
     #[test]
     fn toggles_flip_and_show_on_off() {
         let mut config = Config::default();
+        let lengths = Lengths::new(&config);
         assert_eq!(Setting::LiveWpm.value(&config), "off");
-        Setting::LiveWpm.cycle(&mut config, Step::Next);
+        Setting::LiveWpm.cycle(&mut config, &lengths, Step::Next);
         assert!(config.live_wpm);
         assert_eq!(Setting::LiveWpm.value(&config), "on");
     }
 
     #[test]
+    fn every_setting_has_a_description() {
+        let config = Config::default();
+        for setting in Setting::ALL {
+            assert!(!setting.description(&config).is_empty(), "{setting:?}");
+        }
+    }
+
+    #[test]
+    fn confidence_description_follows_value() {
+        let mut config = Config::default();
+        let lengths = Lengths::new(&config);
+        Setting::Confidence.cycle(&mut config, &lengths, Step::Next);
+        assert_eq!(
+            Setting::Confidence.description(&config),
+            "backspace stays within the current word"
+        );
+    }
+
+    #[test]
+    fn length_choices_flag_the_selected_preset() {
+        let config = Config::default();
+        let selected: Vec<String> = Lengths::new(&config)
+            .choices(&config)
+            .into_iter()
+            .filter_map(|choice| choice.selected.then_some(choice.label))
+            .collect();
+        assert_eq!(selected, ["30"]);
+    }
+
+    #[test]
+    fn length_choices_merge_a_custom_length_in_order() {
+        let config = Config {
+            mode: Mode::Words,
+            words: 40,
+            ..Config::default()
+        };
+        let labels: Vec<String> = Lengths::new(&config)
+            .choices(&config)
+            .into_iter()
+            .map(|choice| choice.label)
+            .collect();
+        assert_eq!(labels, ["10", "25", "40", "50", "100"]);
+    }
+
+    #[test]
     fn only_the_current_modes_length_is_active() {
         let mut config = Config::default();
+        let lengths = Lengths::new(&config);
         assert!(Setting::Time.is_active(&config));
         assert!(!Setting::Words.is_active(&config));
 
-        Setting::Mode.cycle(&mut config, Step::Next);
+        Setting::Mode.cycle(&mut config, &lengths, Step::Next);
         assert!(!Setting::Time.is_active(&config));
         assert!(Setting::Words.is_active(&config));
     }

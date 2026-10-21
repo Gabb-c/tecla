@@ -25,23 +25,29 @@ cargo run --release
 
 ## Keybindings
 
-| Screen                     | Key                                         | Action                    |
-| -------------------------- | ------------------------------------------- | ------------------------- |
-| Typing                     | any character                               | type                      |
-| Typing                     | `Space`                                     | move to the next word     |
-| Typing                     | `Backspace`                                 | delete the last character |
-| Typing                     | `Ctrl-Backspace`, `Alt-Backspace`, `Ctrl-W` | delete the current word   |
-| Typing                     | `Tab`                                       | restart with new words    |
-| Typing                     | `Esc`                                       | open settings             |
-| Results, History           | `Tab`, `Enter`                              | start a new test          |
-| Results                    | `h`                                         | open history              |
-| Results                    | `Esc`                                       | open settings             |
-| History                    | `Esc`, `h`                                  | back to results           |
-| Settings                   | `↑`/`↓`, `k`/`j`                            | select a setting          |
-| Settings                   | `←`/`→`, `h`/`l`, `Enter`, `Space`          | change its value          |
-| Settings                   | `Esc`                                       | back to a new test        |
-| Results, History, Settings | `q`                                         | quit                      |
-| Any                        | `Ctrl-C`                                    | quit                      |
+`Tab` always starts a new test, `Esc` always goes back, and `?` lists the keys of the current
+screen.
+
+| Screen                             | Key                                         | Action                         |
+| ---------------------------------- | ------------------------------------------- | ------------------------------ |
+| Typing                             | any character                               | type                           |
+| Typing                             | `Space`                                     | move to the next word          |
+| Typing                             | `Backspace`                                 | delete the last character      |
+| Typing                             | `Ctrl-Backspace`, `Alt-Backspace`, `Ctrl-W` | delete the current word        |
+| Typing, before the first keystroke | `←`/`→`                                     | change the test length         |
+| Typing, before the first keystroke | `↑`/`↓`                                     | switch between time and words  |
+| Typing                             | `Esc`                                       | open the menu                  |
+| Menu, Results                      | `s`                                         | open settings                  |
+| Menu, Results                      | `h`                                         | open history                   |
+| Results                            | `Enter`, `Esc`                              | start a new test               |
+| History                            | `Enter`                                     | start a new test               |
+| Settings                           | `↑`/`↓`, `k`/`j`                            | select a setting               |
+| Settings                           | `←`/`→`, `h`/`l`, `Enter`, `Space`          | change its value               |
+| Any                                | `Tab`                                       | start a new test               |
+| Menu, Settings, History            | `Esc`                                       | go back                        |
+| Menu, Results, History, Settings   | `?`                                         | show keys                      |
+| Menu, Results, History, Settings   | `q`                                         | quit                           |
+| Any                                | `Ctrl-C`                                    | quit                           |
 
 Input is matched word by word, like Monkeytype. Letters typed past the end of a word stay in
 that word as extra letters, and pressing space moves on to the next word, leaving any skipped
@@ -49,8 +55,9 @@ letters missed. Backspace can go back into the previous word only if it has a mi
 
 ## Settings
 
-Press `Esc` to open the settings screen. Every change is saved right away to `config.toml` in
-the XDG config directory:
+Change the test mode and length with the arrow keys before you start typing, or press `Esc`
+then `s` for every setting. Every change is saved right away to `config.toml` in the XDG config
+directory:
 
 | Platform     | Path                                                                |
 | ------------ | ------------------------------------------------------------------- |

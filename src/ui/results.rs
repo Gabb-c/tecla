@@ -93,12 +93,9 @@ impl<'a> ResultsView<'a> {
     }
 
     fn footer(&self) -> Text<'a> {
-        let mut lines = Vec::with_capacity(2);
-        if let Some(notice) = self.notice {
-            lines.push(Line::from(notice).red());
-        }
-        lines.push(Line::from("tab/enter restart · h history · esc settings · q quit").dark_gray());
-        Text::from(lines).centered()
+        self.notice
+            .map_or_else(Text::default, |notice| Line::from(notice).red().into())
+            .centered()
     }
 }
 
@@ -250,7 +247,7 @@ mod tests {
         assert!(screen.contains("30s"), "{screen}");
     }
 
-    /// A full 30 second test's results in a terminal too short for the chart.
+    /// A full 30 second test's results, with a notice, in a terminal too short for the chart.
     fn rendered_short() -> String {
         let results = results();
         let timeline = steady_timeline(30);
@@ -260,7 +257,7 @@ mod tests {
                 timeline: &timeline,
                 test: Test::Time(30),
                 pb: None,
-                notice: None,
+                notice: Some("history not saved"),
             },
             80,
             18,
@@ -276,7 +273,7 @@ mod tests {
     #[test]
     fn keeps_footer_when_short() {
         let screen = rendered_short();
-        assert!(screen.contains("tab/enter restart"), "{screen}");
+        assert!(screen.contains("history not saved"), "{screen}");
     }
 
     #[test]

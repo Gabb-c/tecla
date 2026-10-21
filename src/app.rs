@@ -11,7 +11,8 @@ use crate::config::{Caret, Config, ConfigFile, Mode};
 use crate::engine::{Input, Limit, Session};
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::history::{self, History, Pb, Record, Summary, Test};
-use crate::settings::{Setting, Step};
+use crate::keymap::{self, Action, Target, View};
+use crate::settings::{Lengths, Setting, Step};
 use crate::stats::{Results, Timeline};
 use crate::{ui, words};
 
@@ -37,18 +38,48 @@ pub struct Finished {
     pub pb: Option<Pb>,
 }
 
+/// The screen that settings and history go back to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Origin {
+    Menu,
+    Results(Finished),
+}
+
+impl Origin {
+    fn screen(self) -> Screen {
+        match self {
+            Self::Menu => Screen::Menu,
+            Self::Results(finished) => Screen::Results(finished),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Screen {
     Typing,
+    /// Drawn over the typing screen; leaving it starts a new test.
+    Menu,
     Settings {
         selected: Setting,
+        from: Origin,
     },
     Results(Finished),
-    /// Keeps the results to return to.
     History {
-        finished: Finished,
         summaries: Vec<Summary>,
+        from: Origin,
     },
+}
+
+impl Screen {
+    pub fn view(&self) -> View {
+        match self {
+            Self::Typing => View::Typing,
+            Self::Menu => View::Menu,
+            Self::Settings { .. } => View::Settings,
+            Self::Results(_) => View::Results,
+            Self::History { .. } => View::History,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -71,6 +102,9 @@ pub struct App {
     pub(crate) records: Option<Vec<Record>>,
     /// Problem reading the history, shown on the history screen.
     pub(crate) history_notice: Option<String>,
+    /// Whether the key help is drawn over the screen.
+    pub(crate) help: bool,
+    pub(crate) lengths: Lengths,
     events: EventHandler,
 }
 
@@ -88,6 +122,7 @@ impl App {
             screen: Screen::Typing,
             session: new_session(&config),
             timeline: Timeline::default(),
+            lengths: Lengths::new(&config),
             config,
             notice: None,
             config_notice,
@@ -95,6 +130,7 @@ impl App {
             history,
             records,
             history_notice,
+            help: false,
             events: EventHandler::new(),
         }
     }
@@ -154,63 +190,87 @@ impl App {
             self.events.send(AppEvent::Quit);
             return;
         }
-        match (&self.screen, key.code) {
-            (Screen::Typing | Screen::Results(_), KeyCode::Esc) => {
-                self.screen = Screen::Settings {
-                    selected: Setting::Mode,
-                };
-            }
-            (Screen::Typing, KeyCode::Tab)
-            | (Screen::Results(_) | Screen::History { .. }, KeyCode::Tab | KeyCode::Enter)
-            | (Screen::Settings { .. }, KeyCode::Esc) => self.restart(),
-            (
-                Screen::Results(_) | Screen::History { .. } | Screen::Settings { .. },
-                KeyCode::Char('q'),
-            ) => {
-                self.events.send(AppEvent::Quit);
-            }
-            (&Screen::Results(finished), KeyCode::Char('h')) => {
-                let summaries = history::summarize(self.records.as_deref().unwrap_or_default());
-                self.screen = Screen::History {
-                    finished,
-                    summaries,
-                };
-            }
-            (&Screen::History { finished, .. }, KeyCode::Esc | KeyCode::Char('h')) => {
-                self.screen = Screen::Results(finished);
-            }
-            (Screen::Typing, _) => {
-                if let Some(input) = typing_input(key) {
-                    self.input(input);
-                }
-            }
-            (&Screen::Settings { selected }, code) => self.settings_key(selected, code),
-            (Screen::Results(_) | Screen::History { .. }, _) => {}
+        if self.help {
+            self.help = false;
+            return;
+        }
+        if let Some(action) = keymap::action(self.screen.view(), key) {
+            self.apply(action);
+        } else if matches!(self.screen, Screen::Typing)
+            && let Some(input) = typing_input(key)
+        {
+            self.input(input);
         }
     }
 
-    fn settings_key(&mut self, selected: Setting, code: KeyCode) {
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.screen = Screen::Settings {
-                    selected: selected.step(Step::Prev),
-                };
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.screen = Screen::Settings {
-                    selected: selected.step(Step::Next),
-                };
-            }
-            KeyCode::Left | KeyCode::Char('h') => self.change(selected, Step::Prev),
-            KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::Enter => {
-                self.change(selected, Step::Next);
-            }
-            _ => {}
+    fn apply(&mut self, action: Action) {
+        if action.is_next_test() && self.session.is_started() {
+            return;
         }
+        match action {
+            Action::Restart => self.restart(),
+            Action::Back => self.back(),
+            Action::Quit => self.events.send(AppEvent::Quit),
+            Action::Open(target) => self.open(target),
+            Action::Help => self.help = true,
+            Action::Select(direction) => {
+                if let Screen::Settings { selected, .. } = &mut self.screen {
+                    *selected = selected.step(direction);
+                }
+            }
+            Action::Change(direction) => {
+                if let Screen::Settings { selected, .. } = self.screen {
+                    self.change(selected, direction);
+                }
+            }
+            Action::CycleMode => self.change_next_test(Setting::Mode, Step::Next),
+            Action::CycleLength(direction) => {
+                let length = match self.config.mode {
+                    Mode::Time => Setting::Time,
+                    Mode::Words => Setting::Words,
+                };
+                self.change_next_test(length, direction);
+            }
+        }
+    }
+
+    fn back(&mut self) {
+        match self.screen {
+            Screen::Typing => self.screen = Screen::Menu,
+            // the test behind the menu may have run on, and settings may have changed
+            Screen::Menu | Screen::Results(_) => self.restart(),
+            Screen::Settings { from, .. } | Screen::History { from, .. } => {
+                self.screen = from.screen();
+            }
+        }
+    }
+
+    /// Opens `target` from the results, or else from the menu.
+    fn open(&mut self, target: Target) {
+        let from = match self.screen {
+            Screen::Results(finished) => Origin::Results(finished),
+            _ => Origin::Menu,
+        };
+        self.screen = match target {
+            Target::Settings => Screen::Settings {
+                selected: Setting::Mode,
+                from,
+            },
+            Target::History => Screen::History {
+                summaries: history::summarize(self.records.as_deref().unwrap_or_default()),
+                from,
+            },
+        };
+    }
+
+    /// Changes `setting` from the typing screen.
+    fn change_next_test(&mut self, setting: Setting, direction: Step) {
+        self.change(setting, direction);
+        self.restart();
     }
 
     fn change(&mut self, setting: Setting, direction: Step) {
-        setting.cycle(&mut self.config, direction);
+        setting.cycle(&mut self.config, &self.lengths, direction);
         if let Some(file) = &self.config_file {
             self.config_notice = file
                 .save(&self.config)
@@ -392,6 +452,7 @@ mod tests {
             screen: Screen::Typing,
             session: new_session(&config),
             timeline: Timeline::default(),
+            lengths: Lengths::new(&config),
             config,
             notice: None,
             config_notice: None,
@@ -399,6 +460,7 @@ mod tests {
             history: None,
             records: Some(Vec::new()),
             history_notice: None,
+            help: false,
             events: EventHandler::detached(),
         }
     }
@@ -440,19 +502,22 @@ mod tests {
     }
 
     #[test]
-    fn esc_opens_settings_and_returns_with_new_mode() {
+    fn esc_opens_menu() {
         let mut app = app(Config::default());
         press(&mut app, KeyCode::Esc);
-        assert!(matches!(
-            app.screen,
-            Screen::Settings {
-                selected: Setting::Mode
-            }
-        ));
+        assert!(matches!(app.screen, Screen::Menu));
+    }
 
+    #[test]
+    fn settings_from_menu_return_to_menu_then_new_mode_test() {
+        let mut app = app(Config::default());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Right);
         assert_eq!(app.config.mode, Mode::Words);
-        assert_eq!(app.session.limit(), Limit::Time(Duration::from_secs(30)));
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Menu));
 
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.screen, Screen::Typing));
@@ -464,20 +529,155 @@ mod tests {
     fn settings_selection_wraps() {
         let mut app = app(Config::default());
         press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Up);
         assert!(matches!(
             app.screen,
             Screen::Settings {
-                selected: Setting::KeyTips
+                selected: Setting::KeyTips,
+                ..
             }
         ));
         press(&mut app, KeyCode::Char('j'));
         assert!(matches!(
             app.screen,
             Screen::Settings {
-                selected: Setting::Mode
+                selected: Setting::Mode,
+                ..
             }
         ));
+    }
+
+    #[test]
+    fn history_opens_from_menu_before_any_test() {
+        let mut app = app(Config::default());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('h'));
+        assert!(matches!(
+            app.screen,
+            Screen::History {
+                from: Origin::Menu,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn esc_from_history_returns_to_menu() {
+        let mut app = app(Config::default());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('h'));
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Menu));
+    }
+
+    #[test]
+    fn leaving_menu_starts_a_new_test() {
+        let mut app = app(Config::default());
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Typing));
+        assert!(!app.session.is_started());
+    }
+
+    #[test]
+    fn tab_from_settings_starts_a_test() {
+        let mut app = app(Config::default());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('s'));
+
+        press(&mut app, KeyCode::Tab);
+        assert!(matches!(app.screen, Screen::Typing));
+    }
+
+    #[test]
+    fn esc_from_settings_returns_to_same_results() {
+        let mut app = app(three_words());
+        type_all(&mut app);
+        let Screen::Results(finished) = app.screen else {
+            panic!("not on results: {:?}", app.screen);
+        };
+        press(&mut app, KeyCode::Char('s'));
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Results(f) if f == finished));
+    }
+
+    #[test]
+    fn esc_from_results_starts_a_new_test() {
+        let mut app = app(three_words());
+        type_all(&mut app);
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Typing));
+    }
+
+    #[test]
+    fn right_arrow_before_start_lengthens_the_test() {
+        let mut app = app(Config::default());
+        press(&mut app, KeyCode::Right);
+
+        assert_eq!(app.session.limit(), Limit::Time(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn right_arrow_before_start_saves_the_config() {
+        let dir = TempDir::new("quick-length");
+        let file = ConfigFile::new(dir.0.join("config.toml"));
+        let mut app = App {
+            config_file: Some(file.clone()),
+            ..app(Config::default())
+        };
+        press(&mut app, KeyCode::Right);
+
+        assert_eq!(file.load().map(|config| config.time).ok(), Some(60));
+    }
+
+    #[test]
+    fn arrows_after_start_are_ignored() {
+        let mut app = app(Config::default());
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+
+        assert_eq!(app.config, Config::default());
+        assert!(app.session.is_started());
+    }
+
+    #[test]
+    fn custom_length_survives_quick_round_trip() {
+        let mut app = app(Config {
+            mode: Mode::Words,
+            words: 40,
+            ..Config::default()
+        });
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Left);
+
+        assert_eq!(app.config.words, 40);
+    }
+
+    #[test]
+    fn down_arrow_before_start_switches_mode() {
+        let mut app = app(Config::default());
+        press(&mut app, KeyCode::Down);
+
+        assert_eq!(app.session.limit(), Limit::Words);
+    }
+
+    #[test]
+    fn help_closes_on_next_key_without_acting() {
+        let mut app = app(three_words());
+        type_all(&mut app);
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.help);
+
+        press(&mut app, KeyCode::Char('h'));
+        assert!(!app.help);
+        assert!(matches!(app.screen, Screen::Results(_)));
     }
 
     #[test]
