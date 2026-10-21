@@ -5,8 +5,7 @@
   </picture>
 </h1>
 
-A minimalist typing speed test for the terminal, inspired by [Monkeytype] and built with
-[Ratatui].
+A minimalist typing speed test for the terminal, built with [Ratatui].
 
 Type random words against the clock or through a fixed word count. The timer starts on your
 first keypress. Results are saved to a local history file.
@@ -49,7 +48,7 @@ screen.
 | Menu, Results, History, Settings   | `q`                                         | quit                           |
 | Any                                | `Ctrl-C`                                    | quit                           |
 
-Input is matched word by word, like Monkeytype. Letters typed past the end of a word stay in
+Input is matched word by word. Letters typed past the end of a word stay in
 that word as extra letters, and pressing space moves on to the next word, leaving any skipped
 letters missed. Backspace can go back into the previous word only if it has a mistake.
 
@@ -98,12 +97,11 @@ A character is one grapheme cluster (so `é` counts once), and a word is five ch
 - **Accuracy**: correct keystrokes / total character keystrokes. A mistake you fix later still
   counts as a mistake. Backspace is not a character keystroke.
 
-- **Consistency**: how steady your raw speed stayed, from 0 to 100%. It is Monkeytype's
-  `kogasa(σ / μ)` over the raw WPM of each second, where
-  `kogasa(c) = 100 × (1 − tanh(c + c³/3 + c⁵/5))`, with three changes. Per-second values are not
-  rounded. The mean and deviation are weighted by interval length. A final interval under half a
-  second is merged into the one before it instead of being dropped. With equal one-second
-  intervals it matches Monkeytype. It shows `-` for tests under two seconds.
+- **Consistency**: how steady your raw speed stayed, from 0 to 100%. It is
+  `100 × (1 − tanh(c + c³/3 + c⁵/5))`, where `c = σ / μ` over the raw WPM of each second.
+  Per-second values are not rounded. The mean and deviation are weighted by interval length. A
+  final interval under half a second is merged into the one before it. It shows `-` for tests
+  under two seconds.
 
 The results screen also counts letters as correct, incorrect, extra (typed past the end of a
 word) and missed (skipped by moving on to the next word). Below the stats, a chart plots net WPM
@@ -128,8 +126,6 @@ says how many.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
+Licensed under the [MIT license](LICENSE).
 
-[Monkeytype]: https://monkeytype.com
 [Ratatui]: https://ratatui.rs

@@ -14,10 +14,10 @@
 //!
 //! Zero elapsed time yields 0 WPM, and zero character keystrokes yield 0% accuracy.
 //!
-//! **Consistency** = `kogasa(σ / μ)` over the raw WPM of each roughly one-second interval, with
-//! the mean and deviation weighted by interval length. A final interval under [`MIN_TAIL`] is
-//! merged into the one before it. It is undefined with fewer than two intervals or no
-//! keystrokes.
+//! **Consistency** = `100 × (1 − tanh(c + c³/3 + c⁵/5))`, where `c = σ / μ` over the raw WPM of
+//! each roughly one-second interval, with the mean and deviation weighted by interval length. A
+//! final interval under [`MIN_TAIL`] is merged into the one before it. It is undefined with fewer
+//! than two intervals or no keystrokes.
 
 use std::time::{Duration, Instant};
 
@@ -221,11 +221,11 @@ fn weighted_consistency(bursts: &[(f64, f64)]) -> Option<f64> {
         .map(|(secs, raw)| secs * (raw - mean).powi(2))
         .sum::<f64>()
         / total;
-    Some(kogasa(variance.sqrt() / mean))
+    Some(variation_score(variance.sqrt() / mean))
 }
 
 /// Maps a coefficient of variation to a 0–100 score.
-fn kogasa(cov: f64) -> f64 {
+fn variation_score(cov: f64) -> f64 {
     100.0 * (1.0 - (cov + cov.powi(3) / 3.0 + cov.powi(5) / 5.0).tanh())
 }
 
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn consistency_weights_intervals_by_length() {
         // mean (60 + 2 × 30) / 3 = 40, variance (400 + 2 × 100) / 3 = 200
-        let expected = kogasa(200.0_f64.sqrt() / 40.0);
+        let expected = variation_score(200.0_f64.sqrt() / 40.0);
         assert_eq!(
             weighted_consistency(&[(1.0, 60.0), (2.0, 30.0)]),
             Some(expected)
@@ -409,19 +409,19 @@ mod tests {
     }
 
     #[test]
-    fn kogasa_of_no_variation_is_full_score() {
-        assert_eq!(kogasa(0.0), 100.0);
+    fn variation_score_of_no_variation_is_full_score() {
+        assert_eq!(variation_score(0.0), 100.0);
     }
 
     #[test]
-    fn kogasa_of_half_variation() {
-        let score = kogasa(0.5);
+    fn variation_score_of_half_variation() {
+        let score = variation_score(0.5);
         assert!((score - 50.104_283).abs() < 1e-5, "{score}");
     }
 
     #[test]
-    fn kogasa_of_full_variation() {
-        let score = kogasa(1.0);
+    fn variation_score_of_full_variation() {
+        let score = variation_score(1.0);
         assert!((score - 8.900_671).abs() < 1e-5, "{score}");
     }
 
