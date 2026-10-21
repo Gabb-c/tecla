@@ -1,4 +1,4 @@
-use color_eyre::eyre::WrapErr;
+use eyre::WrapErr;
 use ratatui::crossterm::event::{self, Event as CrosstermEvent};
 use std::{
     sync::mpsc,
@@ -15,7 +15,7 @@ pub enum Event {
     Crossterm(CrosstermEvent),
     App(AppEvent),
     /// The event thread failed and stopped; no further terminal events will arrive.
-    Error(color_eyre::Report),
+    Error(eyre::Report),
 }
 
 #[derive(Clone, Debug)]
@@ -52,7 +52,7 @@ impl EventHandler {
     ///
     /// Returns an error if the channel is disconnected, which cannot happen while `self` holds
     /// a sender.
-    pub fn next(&self) -> color_eyre::Result<Event> {
+    pub fn next(&self) -> eyre::Result<Event> {
         Ok(self.receiver.recv()?)
     }
 
@@ -80,7 +80,7 @@ impl EventThread {
     }
 
     /// Emits ticks at a fixed rate and forwards crossterm events in between.
-    fn event_loop(&self) -> color_eyre::Result<()> {
+    fn event_loop(&self) -> eyre::Result<()> {
         let tick_interval = Duration::from_secs_f64(1.0 / TICK_FPS);
         let mut last_tick = Instant::now();
         loop {

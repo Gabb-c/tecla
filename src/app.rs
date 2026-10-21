@@ -141,7 +141,7 @@ impl App {
     ///
     /// Returns an error if drawing or setting the cursor style fails, or the terminal stops
     /// delivering events.
-    pub fn run(mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
+    pub fn run(mut self, terminal: &mut DefaultTerminal) -> eyre::Result<()> {
         let mut redraw = true;
         // style last sent to the terminal
         let mut cursor = None;
@@ -161,7 +161,7 @@ impl App {
     }
 
     /// Handles the next event and returns whether the screen needs redrawing.
-    fn handle_events(&mut self) -> color_eyre::Result<bool> {
+    fn handle_events(&mut self) -> eyre::Result<bool> {
         let redraw = match self.events.next()? {
             Event::Tick => {
                 // checked before ticking so the tick that ends the test still redraws
