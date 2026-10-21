@@ -1,4 +1,9 @@
-# tecla
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/tecla-dark.svg">
+    <img src="assets/logo/tecla-light.svg" alt="tecla" width="455">
+  </picture>
+</h1>
 
 A minimalist typing speed test for the terminal, inspired by [Monkeytype] and built with
 [Ratatui].
